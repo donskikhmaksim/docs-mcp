@@ -91,25 +91,38 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
   server.registerTool(
     "docs_read",
     {
-      title: "Read document",
+      title: "Read documents",
       description:
-        "Read a Google Doc as plain text. Set `raw` to true to get the full structural JSON instead.",
+        "Read one or more Google Docs as plain text. Returns results for each documentId.",
       inputSchema: {
         account,
-        documentId: z.string(),
-        raw: z.boolean().default(false).optional(),
+        documentIds: z.array(z.string()).min(1),
       },
     },
-    guard(async ({ account, documentId, raw }) => {
+    guard(async ({ account, documentIds }) => {
       const g = clients.resolve(account);
-      const res = await g.docs.documents.get({ documentId });
-      if (raw) return ok(res.data);
-      const text = documentToPlainText(res.data);
+      const results = await Promise.all(
+        documentIds.map(async (documentId) => {
+          try {
+            const res = await g.docs.documents.get({ documentId });
+            const text = documentToPlainText(res.data);
+            return {
+              documentId,
+              title: res.data.title ?? null,
+              text,
+              characterCount: text.length,
+            };
+          } catch (err: unknown) {
+            return {
+              documentId,
+              error: err instanceof Error ? err.message : String(err),
+            };
+          }
+        }),
+      );
       return ok({
-        summary: `📖 Read "${res.data.title ?? documentId}" — ${text.length} char(s)`,
-        title: res.data.title,
-        documentId: res.data.documentId,
-        text,
+        summary: `📖 Read ${documentIds.length} document(s)`,
+        results,
       });
     }),
   );
@@ -117,32 +130,55 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
   server.registerTool(
     "docs_create",
     {
-      title: "Create document",
+      title: "Create documents",
       description:
-        "Create a new Google Doc, optionally with initial text. Returns its id.",
+        "Create one or more new Google Docs, optionally with initial text. Returns results for each.",
       inputSchema: {
         account,
-        title: z.string(),
-        text: z.string().optional().describe("Optional initial body text."),
+        documents: z
+          .array(
+            z.object({
+              title: z.string(),
+              initialText: z.string().optional().describe("Optional initial body text."),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, title, text }) => {
+    guard(async ({ account, documents }) => {
       const g = clients.resolve(account);
-      const created = await g.docs.documents.create({ requestBody: { title } });
-      const documentId = created.data.documentId!;
-      if (text) {
-        await g.docs.documents.batchUpdate({
-          documentId,
-          requestBody: {
-            requests: [{ insertText: { location: { index: 1 }, text } }],
-          },
-        });
-      }
+      const results = await Promise.all(
+        documents.map(async (doc) => {
+          try {
+            const created = await g.docs.documents.create({
+              requestBody: { title: doc.title },
+            });
+            const documentId = created.data.documentId!;
+            if (doc.initialText) {
+              await g.docs.documents.batchUpdate({
+                documentId,
+                requestBody: {
+                  requests: [
+                    { insertText: { location: { index: 1 }, text: doc.initialText } },
+                  ],
+                },
+              });
+            }
+            return {
+              documentId,
+              title: created.data.title ?? doc.title,
+              documentUrl: `https://docs.google.com/document/d/${documentId}/edit`,
+            };
+          } catch (err: unknown) {
+            return {
+              error: err instanceof Error ? err.message : String(err),
+            };
+          }
+        }),
+      );
       return ok({
-        summary: `📄 Created document "${created.data.title ?? title}"`,
-        documentId,
-        title: created.data.title,
-        url: `https://docs.google.com/document/d/${documentId}/edit`,
+        summary: `📄 Created ${documents.length} document(s)`,
+        results,
       });
     }),
   );
@@ -151,25 +187,55 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
     "docs_append_text",
     {
       title: "Append text",
-      description: "Append text to the end of a document.",
+      description: "Append text to the end of one or more documents.",
       inputSchema: {
         account,
-        documentId: z.string(),
-        text: z.string(),
+        items: z
+          .array(
+            z.object({
+              documentId: z.string(),
+              text: z.string(),
+              ensureNewline: z
+                .boolean()
+                .optional()
+                .describe("Prepend a newline if document doesn't end with one."),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, documentId, text }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const doc = await g.docs.documents.get({ documentId });
-      const index = documentEndIndex(doc.data);
-      const res = await g.docs.documents.batchUpdate({
-        documentId,
-        requestBody: { requests: [{ insertText: { location: { index }, text } }] },
-      });
+      const results: Array<{ documentId: string; addedLength?: number; error?: string }> = [];
+      for (const item of items) {
+        const { documentId, text, ensureNewline } = item;
+        try {
+          const doc = await g.docs.documents.get({ documentId });
+          let insertText = text;
+          if (ensureNewline) {
+            const current = documentToPlainText(doc.data);
+            if (current.length > 0 && !current.endsWith("\n")) {
+              insertText = "\n" + text;
+            }
+          }
+          const index = documentEndIndex(doc.data);
+          await g.docs.documents.batchUpdate({
+            documentId,
+            requestBody: {
+              requests: [{ insertText: { location: { index }, text: insertText } }],
+            },
+          });
+          results.push({ documentId, addedLength: insertText.length });
+        } catch (err: unknown) {
+          results.push({
+            documentId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       return ok({
-        summary: `📝 Appended ${text.length} char(s) to "${doc.data.title ?? documentId}"`,
-        ok: true,
-        writeControl: res.data.writeControl ?? null,
+        summary: `📝 Appended to ${items.length} document(s)`,
+        results,
       });
     }),
   );
@@ -179,28 +245,43 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
     {
       title: "Insert text at index",
       description:
-        "Insert text at a specific character index (1 = very start of the body).",
+        "Insert text at a specific character index in one or more documents (1 = very start of the body). Sequential per document.",
       inputSchema: {
         account,
-        documentId: z.string(),
-        index: z.number().int().min(1),
-        text: z.string(),
+        items: z
+          .array(
+            z.object({
+              documentId: z.string(),
+              text: z.string(),
+              index: z.number().int().min(1),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, documentId, index, text }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      let docTitle: string | null = null;
-      try {
-        const meta = await g.docs.documents.get({ documentId });
-        docTitle = meta.data.title ?? null;
-      } catch {}
-      await g.docs.documents.batchUpdate({
-        documentId,
-        requestBody: { requests: [{ insertText: { location: { index }, text } }] },
-      });
+      const results: Array<{ documentId: string; error?: string }> = [];
+      for (const item of items) {
+        const { documentId, text, index } = item;
+        try {
+          await g.docs.documents.batchUpdate({
+            documentId,
+            requestBody: {
+              requests: [{ insertText: { location: { index }, text } }],
+            },
+          });
+          results.push({ documentId });
+        } catch (err: unknown) {
+          results.push({
+            documentId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       return ok({
-        summary: `📝 Inserted ${text.length} char(s) at index ${index} in "${docTitle ?? documentId}"`,
-        ok: true,
+        summary: `📝 Inserted text into ${items.length} document(s)`,
+        results,
       });
     }),
   );
@@ -209,39 +290,58 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
     "docs_replace_text",
     {
       title: "Replace all text",
-      description: "Find and replace all occurrences of a string in a document.",
+      description:
+        "Find and replace all occurrences of a string in one or more documents. Sequential per document.",
       inputSchema: {
         account,
-        documentId: z.string(),
-        find: z.string(),
-        replace: z.string(),
-        matchCase: z.boolean().default(false).optional(),
+        items: z
+          .array(
+            z.object({
+              documentId: z.string(),
+              find: z.string(),
+              replace: z.string(),
+              matchCase: z.boolean().default(false).optional(),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, documentId, find, replace, matchCase }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      let docTitle: string | null = null;
-      try {
-        const meta = await g.docs.documents.get({ documentId });
-        docTitle = meta.data.title ?? null;
-      } catch {}
-      const res = await g.docs.documents.batchUpdate({
-        documentId,
-        requestBody: {
-          requests: [
-            {
-              replaceAllText: {
-                containsText: { text: find, matchCase: matchCase ?? false },
-                replaceText: replace,
-              },
+      const results: Array<{
+        documentId: string;
+        occurrencesChanged?: number;
+        error?: string;
+      }> = [];
+      for (const item of items) {
+        const { documentId, find, replace, matchCase } = item;
+        try {
+          const res = await g.docs.documents.batchUpdate({
+            documentId,
+            requestBody: {
+              requests: [
+                {
+                  replaceAllText: {
+                    containsText: { text: find, matchCase: matchCase ?? false },
+                    replaceText: replace,
+                  },
+                },
+              ],
             },
-          ],
-        },
-      });
-      const occurrencesChanged = res.data.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
+          });
+          const occurrencesChanged =
+            res.data.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
+          results.push({ documentId, occurrencesChanged });
+        } catch (err: unknown) {
+          results.push({
+            documentId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       return ok({
-        summary: `🔄 Replaced "${find}" → "${replace}" in "${docTitle ?? documentId}" — ${occurrencesChanged} occurrence(s)`,
-        occurrencesChanged,
+        summary: `🔄 Replace operations on ${items.length} document(s)`,
+        results,
       });
     }),
   );
@@ -251,24 +351,44 @@ export function registerDocsTools(server: McpServer, clients: UserClients) {
     {
       title: "Raw Docs batchUpdate (advanced)",
       description:
-        "Send raw Docs API batchUpdate `requests` (styling, tables, images, etc.). Use only when other tools are not enough.",
+        "Send raw Docs API batchUpdate `requests` to one or more documents (styling, tables, images, etc.). Sequential per document. Use only when other tools are not enough.",
       inputSchema: {
         account,
-        documentId: z.string(),
-        requests: z.array(z.record(z.string(), z.any())),
+        items: z
+          .array(
+            z.object({
+              documentId: z.string(),
+              requests: z.array(z.record(z.string(), z.any())),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, documentId, requests }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const res = await g.docs.documents.batchUpdate({
-        documentId,
-        requestBody: { requests: requests as object[] },
-      });
+      const results: Array<{
+        documentId: string;
+        replies?: unknown;
+        error?: string;
+      }> = [];
+      for (const item of items) {
+        const { documentId, requests } = item;
+        try {
+          const res = await g.docs.documents.batchUpdate({
+            documentId,
+            requestBody: { requests: requests as object[] },
+          });
+          results.push({ documentId, replies: res.data.replies });
+        } catch (err: unknown) {
+          results.push({
+            documentId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       return ok({
-        summary: `⚙️ Applied ${requests.length} raw request(s) to document ${documentId}`,
-        documentId: res.data.documentId,
-        replies: res.data.replies,
-        writeControl: res.data.writeControl,
+        summary: `⚙️ Raw batchUpdate applied to ${items.length} document(s)`,
+        results,
       });
     }),
   );

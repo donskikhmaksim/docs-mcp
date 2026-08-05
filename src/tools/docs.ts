@@ -452,8 +452,12 @@ async function executeCreateBatchCore(
   auditId: string,
   consentStore: ConsentStore,
 ): Promise<ReturnType<typeof ok>> {
-  const results = await Promise.all(
-    payload.documents.map(async ({ title, initialText }) => {
+  // mapWithLimit (cap 8, util.ts default) instead of unbounded Promise.all —
+  // throttles a large batch's fan-out against Docs/Drive rate limits, matches
+  // existing usage elsewhere in this file (Максим, fix/docs-throttle-and-output).
+  const results = await mapWithLimit(
+    payload.documents,
+    async ({ title, initialText }) => {
       try {
         const created = await g.docs.documents.create({
           requestBody: { title },
@@ -479,7 +483,7 @@ async function executeCreateBatchCore(
           error: err instanceof Error ? err.message : String(err),
         };
       }
-    }),
+    },
   );
 
   return buildMutationResult({
@@ -704,13 +708,19 @@ async function executeReplaceBatchCore(
   // right before the mutation (identity-postverify.md §5.2: replace_text is
   // irreversible content-loss, so this is the only manual-recovery path).
   const preSnapshot = await replaceBindingSnapshot(g, payload.items);
+  // title: fixed pre-mutation lookup (fix/docs-throttle-and-output, Максим) —
+  // human-readable title in the output per mcp-development-standard
+  // output-format.md §7.1 p.2 (objects shown by name, not just id).
+  const titleByDocId = new Map(preSnapshot.map((s) => [s.documentId, s.title]));
   const results: Array<{
     documentId: string;
+    title?: string | null;
     occurrencesChanged?: number;
     error?: string;
   }> = [];
   for (const item of payload.items) {
     const { documentId, find, replace, matchCase } = item;
+    const title = titleByDocId.get(documentId) ?? null;
     try {
       const res = await g.docs.documents.batchUpdate({
         documentId,
@@ -727,10 +737,11 @@ async function executeReplaceBatchCore(
       });
       const occurrencesChanged =
         res.data.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
-      results.push({ documentId, occurrencesChanged });
+      results.push({ documentId, title, occurrencesChanged });
     } catch (err: unknown) {
       results.push({
         documentId,
+        title,
         error: err instanceof Error ? err.message : String(err),
       });
     }

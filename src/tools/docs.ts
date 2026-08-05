@@ -570,8 +570,9 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await Promise.all(
-        payload.documents.map(async ({ title, initialText }) => {
+      const results = await mapWithLimit(
+        payload.documents,
+        async ({ title, initialText }) => {
           try {
             const created = await g.docs.documents.create({
               requestBody: { title },
@@ -597,7 +598,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
               error: err instanceof Error ? err.message : String(err),
             };
           }
-        }),
+        },
       );
 
       return buildMutationResult({
@@ -1012,13 +1013,16 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       // right before the mutation (identity-postverify.md §5.2: replace_text is
       // irreversible content-loss, so this is the only manual-recovery path).
       const preSnapshot = await replaceBindingSnapshot(g, payload.items);
+      const titleByDocId = new Map(preSnapshot.map((s) => [s.documentId, s.title]));
       const results: Array<{
         documentId: string;
+        title?: string | null;
         occurrencesChanged?: number;
         error?: string;
       }> = [];
       for (const item of payload.items) {
         const { documentId, find, replace, matchCase } = item;
+        const title = titleByDocId.get(documentId) ?? null;
         try {
           const res = await g.docs.documents.batchUpdate({
             documentId,
@@ -1035,10 +1039,11 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           });
           const occurrencesChanged =
             res.data.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
-          results.push({ documentId, occurrencesChanged });
+          results.push({ documentId, title, occurrencesChanged });
         } catch (err: unknown) {
           results.push({
             documentId,
+            title,
             error: err instanceof Error ? err.message : String(err),
           });
         }

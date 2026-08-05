@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import type { Account, Config, User } from "./config.js";
-import { buildMcpServer, tgApprovalConfig, tgApprovalStoreAdapter } from "./server.js";
+import { buildMcpServer, tgApprovalConfig, tgApprovalStoreAdapter, consentStoreAdapter, consentServerConfig } from "./server.js";
 import { GoogleFederatedProvider } from "./oauthProvider.js";
 import {
   getGoogleAccounts,
@@ -12,9 +12,13 @@ import {
   removeGoogleAccount,
   setDefaultAccount,
   renameAccount,
+  listApprovedUnexecuted,
 } from "./store.js";
 import { renderDashboard } from "./dashboard.js";
-import { handleWebhook, registerWebhook, secretTokenMatches } from "./tg_approval.js";
+import { buildUserClients } from "./accounts.js";
+import { handleWebhook, registerWebhook, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
+import { tryAutoExecute } from "./consent.js";
+import { getAutoExecutor, type AutoExecutorCtx } from "./autoExecute.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -90,6 +94,75 @@ function secretMatches(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/**
+ * Фоновый поллер авто-исполнения по кнопке (Максим, 2026-08-05 — см.
+ * `consent.ts`'s `tryAutoExecute` doc-comment). Раз в тик находит манифесты
+ * этого сервера, у которых уже APPROVED-строка в `tg_approvals`, но которые
+ * ещё не были исполнены моделью, и исполняет их напрямую через
+ * `autoExecute.ts`'s per-tool `execute` — без единого вызова MCP-инструмента.
+ *
+ * В ОТЛИЧИЕ от `runApprovalSweep` (тот работает ТОЛЬКО на владельце
+ * вебхука) — этот поллер работает НА КАЖДОМ сервере, включая этот, без
+ * гейта по `webhookOwner`: исполнение полностью децентрализовано, сервер
+ * следит только за СВОИМИ манифестами (`consent_manifests.server` = свой
+ * server) — никакой межпроцессной связи с другими серверами не нужно,
+ * кнопка уже централизованно решается общим вебхуком (см. `handleWebhook`),
+ * а этот поллер просто видит результат в общем Postgres.
+ *
+ * Два независимых режима гейта (Максим подтвердил явно) остаются нетронуты:
+ * если `TG_APPROVAL_ENABLED=false` (или тул не в allowlist) — сюда манифест
+ * вообще не попадёт (нет строки в tg_approvals), обычный чат-«да»-путь через
+ * `requireConsent()` работает побайтово как раньше.
+ */
+async function runAutoExecutePoller(config: Config): Promise<void> {
+  const candidates = await listApprovedUnexecuted(consentServerConfig.server, Date.now());
+  if (!candidates.length) return;
+
+  const user = (await userFromGoogleAccounts(config)) ?? config.users[0] ?? null;
+  if (!user) {
+    console.error("TG auto-execute: нет доступного пользователя — пропускаю тик поллера");
+    return;
+  }
+  const clients = buildUserClients(user);
+  // Один ctx на весь тик — тот же объект уходит и в rehash (для тулов с
+  // настоящим биндингом, которым нужен живой `g`), и в execute, см.
+  // `autoExecute.ts`'s `AutoExecutorCtx` doc-comment.
+  const ctx: AutoExecutorCtx = { clients, consentStore: consentStoreAdapter, userToken: user.token ?? null };
+
+  for (const c of candidates) {
+    const executor = getAutoExecutor(c.tool);
+    if (!executor) {
+      // Инструмент ещё не переведён на новый паттерн (см. autoExecute.ts) —
+      // манифест останется PENDING/APPROVED и будет исполнен, как только
+      // модель сама позовёт execute (старый путь), либо когда этот тул
+      // получит свой executor. НЕ ошибка, просто ещё не покрыто.
+      continue;
+    }
+    try {
+      const result = await tryAutoExecute(
+        { manifestId: c.manifestId, tool: c.tool, accountLabel: c.accountLabel },
+        executor.rehash,
+        consentStoreAdapter,
+        consentServerConfig,
+        ctx,
+      );
+      if (!result) continue; // гонка/дрейф/истёк — тихо пропускаем, это не ошибка
+      const reportText = await executor.execute(result.payload, result.auditId, ctx);
+      await reportAutoExecutionResult(tgApprovalConfig, c.chatId, c.messageId, reportText);
+    } catch (err) {
+      console.error(`TG auto-execute: ошибка при исполнении ${c.tool}/${c.manifestId}:`, err);
+      // НЕ помечаем как исполненное при ошибке ДО tryAutoExecute — если он
+      // успел вызвать consumeManifest (манифест одноразовый), повторной
+      // попытки уже не будет; отчёт об ошибке всё равно стоит попытаться
+      // отправить, чтобы Максим не остался с зависшими кнопками в боте.
+      await reportAutoExecutionResult(
+        tgApprovalConfig, c.chatId, c.messageId,
+        `🛑 Ошибка при автоисполнении «${c.tool}»: ${err instanceof Error ? err.message : String(err)}`,
+      ).catch(() => {});
+    }
+  }
 }
 
 export async function startHttpServer(config: Config): Promise<void> {
@@ -309,6 +382,16 @@ export async function startHttpServer(config: Config): Promise<void> {
 
   if (tgApprovalConfig.enabled) {
     await registerWebhook(tgApprovalConfig);
+
+    // Авто-исполнение — отдельный, более частый цикл (отзывчивость важнее
+    // для UX: нажал кнопку, ждёшь секунды, а не минуты). Работает на КАЖДОМ
+    // сервере без гейта webhookOwner — см. runAutoExecutePoller's doc-comment.
+    const AUTO_EXECUTE_INTERVAL_MS = 10 * 1000;
+    setInterval(() => {
+      runAutoExecutePoller(config).catch((err) =>
+        console.error("TG auto-execute poller: unhandled error", err),
+      );
+    }, AUTO_EXECUTE_INTERVAL_MS).unref();
   }
 
   await new Promise<void>((resolve) => {

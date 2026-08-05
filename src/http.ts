@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import type { Account, Config, User } from "./config.js";
-import { buildMcpServer } from "./server.js";
+import { buildMcpServer, tgApprovalConfig, tgApprovalStoreAdapter } from "./server.js";
 import { GoogleFederatedProvider } from "./oauthProvider.js";
 import {
   getGoogleAccounts,
@@ -14,6 +14,7 @@ import {
   renameAccount,
 } from "./store.js";
 import { renderDashboard } from "./dashboard.js";
+import { handleWebhook, registerWebhook, secretTokenMatches } from "./tg_approval.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -105,6 +106,48 @@ export async function startHttpServer(config: Config): Promise<void> {
     res.json({ status: "ok", endpoint: "/mcp" });
   });
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+  // ---- Optional Telegram-approval webhook (plan-tg-approval.md) ----
+  // Deliberately OUTSIDE the normal /mcp auth -- Telegram itself calls this,
+  // not an MCP client. Protected by the secret_token Telegram echoes back on
+  // every request (set via registerWebhook's setWebhook call below), checked
+  // constant-time. Mounted unconditionally (cheap route, no-op body) so
+  // toggling TG_APPROVAL_ENABLED never needs a redeploy of routing -- when
+  // disabled, tgApprovalConfig.webhookSecret is "" and secretTokenMatches
+  // rejects every request (empty expected secret never matches).
+  app.post("/tg/webhook", async (req: Request, res: Response) => {
+    // Route-level gate on TG_WEBHOOK_OWNER -- checked FIRST, before reading
+    // the secret header or the body. Defense-in-depth alongside
+    // registerWebhook's own self-guard (tg_approval.ts): since
+    // consumeTgDecisionAnyServer made webhook consume server-agnostic across
+    // all 6 MCP servers that will eventually share one Telegram bot token
+    // (gmail/sheets/calendar/docs/drive-mcp + ticktick-mcp), a
+    // TG_APPROVAL_WEBHOOK_SECRET leak on ANY single one of them would
+    // otherwise let an attacker decide approvals for every other server too
+    // -- including gmail_send, the most dangerous one. A server that isn't
+    // the designated owner must never process this route at all, even with a
+    // technically-correct secret, and must never depend on whoever ports this
+    // file to the other 5 repos remembering to not mount the route --
+    // 404 (not 401) so a non-owner server doesn't even reveal the route exists.
+    if (!tgApprovalConfig.webhookOwner) {
+      res.status(404).end();
+      return;
+    }
+    const provided = req.header("x-telegram-bot-api-secret-token") ?? "";
+    if (!secretTokenMatches(provided, tgApprovalConfig.webhookSecret)) {
+      res.status(401).end();
+      return;
+    }
+    try {
+      await handleWebhook(tgApprovalConfig, tgApprovalStoreAdapter, req.body);
+    } catch (err) {
+      console.error("TG approval webhook error:", err);
+    }
+    // Always 200 -- Telegram retries on non-2xx, and every failure mode here
+    // (wrong from.id, replay, unknown callback_data) is intentionally a no-op,
+    // not an error Telegram should retry.
+    res.status(200).end();
+  });
 
   let provider: GoogleFederatedProvider | null = null;
 
@@ -263,6 +306,10 @@ export async function startHttpServer(config: Config): Promise<void> {
   };
   app.get("/mcp", methodNotAllowed);
   app.delete("/mcp", methodNotAllowed);
+
+  if (tgApprovalConfig.enabled) {
+    await registerWebhook(tgApprovalConfig);
+  }
 
   await new Promise<void>((resolve) => {
     app.listen(config.port, () => {

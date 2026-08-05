@@ -15,6 +15,13 @@ import {
   type ConsentStore,
   type ConsentConfig,
 } from "../consent.js";
+// TgApprovalGate comes from tg_approval.js, NOT consent.js, because docs-mcp's
+// consent.ts does not yet declare its own `tg?: TgApprovalGate` field/type
+// (unlike gmail-mcp's, which this module was ported from — see server.ts's
+// import note for the same caveat). `ctx.tg` below is therefore plumbed as
+// far as this context object but is NOT yet passed into any `requireConsent()`
+// call below — that last step needs consent.ts to accept it first.
+import type { TgApprovalGate } from "../tg_approval.js";
 
 /** One row of the shared consent_audit log, as read by `docs_consent_audit`.
  * Mirrors store.ts's `ConsentAuditRow` structurally — same "don't import
@@ -71,6 +78,16 @@ export interface DocsConsentContext {
   /** Read-only access to the consent_audit log. null exactly when Postgres
    * isn't configured (same honest-degradation rule as `consentStore`). */
   auditStore: AuditStore | null;
+  /**
+   * Optional out-of-band Telegram-button approval gate (plan-tg-approval.md),
+   * ported from gmail-mcp. Always constructed in server.ts (never undefined
+   * in production), `enabledFor()` simply false when TG_APPROVAL_ENABLED is
+   * unset — a fork without a configured bot is unaffected. NOT YET wired into
+   * the `requireConsent()` calls below: consent.ts here doesn't accept a `tg`
+   * param yet (see this file's top import note). Optional field so existing
+   * callers/tests that build a `DocsConsentContext` without it keep compiling.
+   */
+  tg?: TgApprovalGate;
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit
@@ -511,7 +528,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, documents, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Создание недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -528,6 +545,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: () => {
           if (!documents || !documents.length) {
             throw new Error("Нужен непустой `documents`, чтобы построить план создания.");
@@ -645,7 +663,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Добавление текста недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -662,6 +680,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план добавления текста.");
@@ -791,7 +810,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Вставка текста недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -808,6 +827,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план вставки текста.");
@@ -930,7 +950,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Замена недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -947,6 +967,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план замены.");
@@ -1101,7 +1122,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Raw batchUpdate недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1118,6 +1139,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужны непустой `items`, чтобы построить план.");

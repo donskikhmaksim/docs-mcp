@@ -11,7 +11,8 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node scripts/test-credential-source.mjs"
+    "test:consent": "node scripts/test-consent.mjs",
+    "test": "npm run build && node scripts/test-credential-source.mjs && node scripts/test-consent.mjs && node scripts/test-gate-coverage.mjs && node scripts/test-docs-gate.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

@@ -307,6 +307,50 @@ function loadSingleUser(): User {
   return { name: "default", token, accounts, defaultAccount };
 }
 
+/**
+ * Consent-gate config (packages A1/A2/A3 of gmail-mcp, ported here per
+ * `mcp-development-standard/references/gate.md`). Standalone from the rest of
+ * `Config`/`loadConfig()` on purpose — it's pure env, no user/onboarding
+ * parsing, so `server.ts` can read it once at module scope without re-running
+ * the heavier account setup. Ported byte-for-byte in shape from gmail-mcp's
+ * config.ts; only the `server` default and `minConsentGapMs` default differ
+ * (gmail's 10000 was a mail-specific override — Q3, 2026-08-04; docs uses
+ * the generic 2000 from gate.md §3.3(5)).
+ */
+export interface ConsentGateConfig {
+  /** Constant identifying THIS server in the shared consent_manifests/
+   * consent_audit tables (all 5 MCP servers share one physical Postgres —
+   * plan §0.4). `$self`, never a tool argument. Env CONSENT_SERVER, default
+   * "docs". */
+  server: string;
+  /** Manifest TTL in ms. Env CONSENT_TTL_MS, default 1h. */
+  consentTtlMs: number;
+  /** Minimum gap between plan and execute in ms — anti-doublet check
+   * (gate.md §3.3(2)): catches a model calling plan then execute in the same
+   * turn, before a human could have answered. Env MIN_CONSENT_GAP_MS,
+   * default 2000 — the generic value from gate.md §3.3(5), NOT gmail's
+   * mail-specific 10000 (Q3 override was scoped to mail only). */
+  minConsentGapMs: number;
+  /** Cap on items per manifest/batch — one manifest is one radius of consent
+   * (plan §0.2/[R:полнота-7]); over the cap, the tool refuses with "split it
+   * up" instead of creating a manifest. Env SEND_BATCH_MAX, default 10. */
+  sendBatchMax: number;
+}
+
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+export function loadConsentGateConfig(): ConsentGateConfig {
+  return {
+    server: process.env.CONSENT_SERVER?.trim() || "docs",
+    consentTtlMs: positiveIntEnv("CONSENT_TTL_MS", 3_600_000),
+    minConsentGapMs: positiveIntEnv("MIN_CONSENT_GAP_MS", 2_000),
+    sendBatchMax: positiveIntEnv("SEND_BATCH_MAX", 10),
+  };
+}
+
 export function loadConfig(): Config {
   const transport =
     (process.env.MCP_TRANSPORT as "http" | "stdio" | undefined) ??

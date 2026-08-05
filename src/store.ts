@@ -15,6 +15,13 @@ function getPool(): pg.Pool {
   return pool;
 }
 
+/** True when a database is configured — otherwise callers fall back to
+ * honest degradation (the consent gate refuses outright rather than mutate
+ * unconfirmed; gate.md §3.5). Ported from gmail-mcp's store.ts. */
+export function storeReady(): boolean {
+  return !!pool;
+}
+
 export async function ensureSchema(): Promise<void> {
   const p = getPool();
   // Legacy single-account table (one row, id=1). Kept only so existing
@@ -99,6 +106,63 @@ export async function ensureSchema(): Promise<void> {
       created_at     TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+
+  // ---- Consent gate (ported from gmail-mcp packages A1/A2/A3, mcp-development
+  // -standard/references/gate.md §3). ONE physical Postgres is shared by all 5
+  // MCP servers (gmail/sheets/calendar/docs/drive) — `server` isolates rows
+  // per server ($self, never a tool argument). DDL is FROZEN byte-identical
+  // to gmail-mcp's ensureSchema() (plan §0.4/[R:изоляция-5]): any future DDL
+  // change here must be applied to all 5 `ensureSchema()` copies in the same
+  // pass, or `CREATE TABLE IF NOT EXISTS` silently lets them drift apart.
+  //
+  // Times are epoch-milliseconds (BIGINT), not TIMESTAMPTZ — consent.ts's
+  // `ConsentManifestRow`/`ConsentAuditEntry` types declare plain `number`
+  // fields (it injects a fake `now()` for offline unit tests, which only
+  // works cleanly against numbers), same convention as oauth_codes.expires_at.
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS consent_manifests (
+      id            TEXT PRIMARY KEY,
+      server        TEXT NOT NULL,
+      tool          TEXT NOT NULL,
+      account_label TEXT NOT NULL,
+      payload       JSONB NOT NULL,
+      object_hash   TEXT NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'AWAITING_CONSENT',
+      created_at    BIGINT NOT NULL,
+      expires_at    BIGINT NOT NULL,
+      consumed_at   BIGINT,
+      user_reply    TEXT
+    )
+  `);
+  await p.query(
+    `CREATE INDEX IF NOT EXISTS consent_manifests_cleanup_idx ON consent_manifests (server, status, expires_at)`,
+  );
+  // Append-only audit trail. Written in two phases (plan §0.4/[R:полнота-3]):
+  // appendConsentAudit() at the gate DECISION (confirmed/refused/invalidated),
+  // then updateConsentAuditOutcome() fills in what the MUTATION actually did
+  // (post-verify, error) — called by whichever package wires the gate into a
+  // real tool, after it has actually mutated. pre_snapshot/post_verify_result/
+  // error stay NULL until something populates them.
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS consent_audit (
+      id                 TEXT PRIMARY KEY,
+      ts                 BIGINT NOT NULL,
+      server             TEXT NOT NULL,
+      tool               TEXT NOT NULL,
+      account_label      TEXT NOT NULL,
+      manifest_id        TEXT,
+      object_hash        TEXT,
+      user_reply         TEXT NOT NULL,
+      checks             JSONB NOT NULL,
+      outcome            TEXT NOT NULL,
+      refusal_reason     TEXT,
+      actor              TEXT NOT NULL DEFAULT 'human',
+      pre_snapshot       JSONB,
+      post_verify_result TEXT,
+      error              TEXT
+    )
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS consent_audit_server_ts_idx ON consent_audit (server, ts DESC)`);
 }
 
 // ---- Google accounts (multi-account, one owner per instance) ----
@@ -400,6 +464,308 @@ export async function deleteTokenByRefresh(refreshToken: string): Promise<void> 
 export async function deleteTokenByAccess(accessToken: string): Promise<void> {
   const p = getPool();
   await p.query(`DELETE FROM oauth_tokens WHERE access_token = $1`, [accessToken]);
+}
+
+// ---- Consent gate: manifests + audit (ported from gmail-mcp package A1) ----
+// SIGNATURE (checked below via a typed annotation in server.ts) — this file
+// does not import consent.ts (store.ts stays a leaf module; consent.ts is the
+// generic, portable one). `server` is always the caller's own constant
+// ($self, "docs") — every query filters on it so the 5 servers sharing this
+// Postgres can never see each other's manifests/audit rows.
+
+export interface ConsentManifestRow {
+  id: string;
+  server: string;
+  tool: string;
+  accountLabel: string;
+  payload: unknown;
+  objectHash: string;
+  status: "AWAITING_CONSENT" | "DONE" | "INVALIDATED";
+  createdAt: number;
+  expiresAt: number;
+  consumedAt?: number | null;
+  userReply?: string | null;
+}
+
+export interface ConsentAuditEntry {
+  id: string;
+  ts: number;
+  server: string;
+  tool: string;
+  accountLabel: string;
+  manifestId?: string | null;
+  objectHash?: string | null;
+  userReply: string;
+  checks: Record<string, string>;
+  outcome: "confirmed" | "refused" | "invalidated";
+  refusalReason?: string | null;
+  actor: string;
+}
+
+function rowToManifest(row: {
+  id: string;
+  server: string;
+  tool: string;
+  account_label: string;
+  payload: unknown;
+  object_hash: string;
+  status: string;
+  created_at: string | number;
+  expires_at: string | number;
+  consumed_at: string | number | null;
+  user_reply: string | null;
+}): ConsentManifestRow {
+  return {
+    id: row.id,
+    server: row.server,
+    tool: row.tool,
+    accountLabel: row.account_label,
+    payload: row.payload,
+    objectHash: row.object_hash,
+    status: row.status as ConsentManifestRow["status"],
+    createdAt: Number(row.created_at),
+    expiresAt: Number(row.expires_at),
+    consumedAt: row.consumed_at === null ? null : Number(row.consumed_at),
+    userReply: row.user_reply,
+  };
+}
+
+/** Inserts a new manifest in AWAITING_CONSENT. Opportunistically sweeps this
+ * server's own expired-but-still-AWAITING rows first (same pattern as
+ * download_tokens above) — nothing waits on the sweep, it just keeps the
+ * shared table from growing unboundedly across all 5 servers. */
+export async function createManifest(input: {
+  id: string;
+  server: string;
+  tool: string;
+  accountLabel: string;
+  payload: unknown;
+  objectHash: string;
+  createdAt: number;
+  expiresAt: number;
+}): Promise<void> {
+  const p = getPool();
+  await p.query(
+    `DELETE FROM consent_manifests WHERE server = $1 AND status = 'AWAITING_CONSENT' AND expires_at < $2`,
+    [input.server, Date.now()],
+  );
+  await p.query(
+    `INSERT INTO consent_manifests
+       (id, server, tool, account_label, payload, object_hash, status, created_at, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, 'AWAITING_CONSENT', $7, $8)`,
+    [
+      input.id,
+      input.server,
+      input.tool,
+      input.accountLabel,
+      JSON.stringify(input.payload),
+      input.objectHash,
+      input.createdAt,
+      input.expiresAt,
+    ],
+  );
+}
+
+/** Reads a manifest scoped to `server`; null if missing OR belongs to another server. */
+export async function getManifest(id: string, server: string): Promise<ConsentManifestRow | null> {
+  const p = getPool();
+  const res = await p.query(`SELECT * FROM consent_manifests WHERE id = $1 AND server = $2`, [id, server]);
+  if (!res.rows.length) return null;
+  return rowToManifest(res.rows[0]);
+}
+
+/**
+ * Atomic one-shot consume — the proof against the double-execute race, same
+ * shape as `consumeCode` above: a single `UPDATE … WHERE … RETURNING` closes
+ * the race in the database, not in JS. Succeeds only if the row is still
+ * AWAITING_CONSENT, belongs to `server`, AND has not expired (checked against
+ * the SAME `now` value used to stamp `consumed_at`, so there's no window
+ * between the compare and the write). Returns null on any miss (unknown id,
+ * wrong server, already DONE/INVALIDATED, or expired) — the caller
+ * (consent.ts) treats every one of those the same way: refuse.
+ */
+export async function consumeManifest(
+  id: string,
+  server: string,
+  userReply: string,
+): Promise<ConsentManifestRow | null> {
+  const p = getPool();
+  const now = Date.now();
+  const res = await p.query(
+    `UPDATE consent_manifests
+        SET status = 'DONE', consumed_at = $4, user_reply = $3
+      WHERE id = $1 AND server = $2 AND status = 'AWAITING_CONSENT' AND expires_at > $4
+      RETURNING *`,
+    [id, server, userReply, now],
+  );
+  if (!res.rows.length) return null;
+  return rowToManifest(res.rows[0]);
+}
+
+/** Marks a manifest INVALIDATED (explicit user negation). No-op if it's not
+ * currently AWAITING_CONSENT for this server (already consumed/expired/invalidated). */
+export async function invalidateManifest(id: string, server: string, userReply: string): Promise<void> {
+  const p = getPool();
+  await p.query(
+    `UPDATE consent_manifests SET status = 'INVALIDATED', user_reply = $3
+      WHERE id = $1 AND server = $2 AND status = 'AWAITING_CONSENT'`,
+    [id, server, userReply],
+  );
+}
+
+/** Append-only: one row per gate decision (confirmed/refused/invalidated). */
+export async function appendConsentAudit(entry: ConsentAuditEntry): Promise<void> {
+  const p = getPool();
+  await p.query(
+    `INSERT INTO consent_audit
+       (id, ts, server, tool, account_label, manifest_id, object_hash, user_reply, checks, outcome, refusal_reason, actor)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+    [
+      entry.id,
+      entry.ts,
+      entry.server,
+      entry.tool,
+      entry.accountLabel,
+      entry.manifestId ?? null,
+      entry.objectHash ?? null,
+      entry.userReply,
+      JSON.stringify(entry.checks),
+      entry.outcome,
+      entry.refusalReason ?? null,
+      entry.actor,
+    ],
+  );
+}
+
+/**
+ * Phase 2 of the audit row: fills in what the MUTATION actually did, called by
+ * whichever package wires the gate into a real tool AFTER it has written/
+ * cleared/whatever — never by consent.ts itself. Matches `ConsentStore`'s
+ * 2-argument contract exactly; `preSnapshot` is an EXTRA optional field beyond
+ * that contract. It's additive and optional, so passing it or not both
+ * satisfy `ConsentStore` structurally.
+ */
+export async function updateConsentAuditOutcome(
+  auditId: string,
+  outcome: {
+    outcome?: "confirmed" | "failed";
+    postVerify?: string | null;
+    error?: string | null;
+    preSnapshot?: unknown;
+  },
+): Promise<void> {
+  const p = getPool();
+  await p.query(
+    `UPDATE consent_audit SET
+       outcome = COALESCE($2, outcome),
+       post_verify_result = COALESCE($3, post_verify_result),
+       error = COALESCE($4, error),
+       pre_snapshot = COALESCE($5, pre_snapshot)
+     WHERE id = $1`,
+    [
+      auditId,
+      outcome.outcome ?? null,
+      outcome.postVerify ?? null,
+      outcome.error ?? null,
+      outcome.preSnapshot !== undefined ? JSON.stringify(outcome.preSnapshot) : null,
+    ],
+  );
+}
+
+export interface ConsentAuditFilters {
+  server: string;
+  since?: number;
+  until?: number;
+  accountLabel?: string;
+  tool?: string;
+  outcome?: string;
+}
+
+export interface ConsentAuditRow extends ConsentAuditEntry {
+  postVerifyResult: string | null;
+  error: string | null;
+  preSnapshot: unknown;
+}
+
+/** Shared WHERE-clause builder for `listConsentAudit`/`countConsentAudit`, so
+ * the two can never drift apart on which rows they mean by "matching the
+ * filters" (a `total` from one query and rows from a different filter set
+ * would be a worse lie than no total at all). */
+function buildAuditWhere(filters: ConsentAuditFilters): { where: string; params: unknown[] } {
+  const conds: string[] = [`server = $1`];
+  const params: unknown[] = [filters.server];
+  if (filters.since != null) {
+    params.push(filters.since);
+    conds.push(`ts >= $${params.length}`);
+  }
+  if (filters.until != null) {
+    params.push(filters.until);
+    conds.push(`ts <= $${params.length}`);
+  }
+  if (filters.accountLabel) {
+    params.push(filters.accountLabel);
+    conds.push(`account_label = $${params.length}`);
+  }
+  if (filters.tool) {
+    params.push(filters.tool);
+    conds.push(`tool = $${params.length}`);
+  }
+  if (filters.outcome) {
+    params.push(filters.outcome);
+    conds.push(`outcome = $${params.length}`);
+  }
+  return { where: conds.join(" AND "), params };
+}
+
+/** Read path for the `docs_consent_audit` tool — "разбор инцидента без ssh"
+ * (limits-audit.md §11). `server` is required and always the caller's own
+ * constant; `limit` is capped to 100 regardless of what's asked (limits-audit
+ * §10.1), default 20. `offset` powers pagination through older rows (§10.1
+ * "показано N из M" — never a silent truncation); newest first. */
+export async function listConsentAudit(
+  filters: ConsentAuditFilters,
+  limit = 20,
+  offset = 0,
+): Promise<ConsentAuditRow[]> {
+  const p = getPool();
+  const cap = Math.min(Math.max(Math.trunc(limit) || 20, 1), 100);
+  const off = Math.max(Math.trunc(offset) || 0, 0);
+  const { where, params } = buildAuditWhere(filters);
+  params.push(cap);
+  const limitIdx = params.length;
+  params.push(off);
+  const offsetIdx = params.length;
+  const res = await p.query(
+    `SELECT * FROM consent_audit WHERE ${where} ORDER BY ts DESC LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+    params,
+  );
+  return res.rows.map((row) => ({
+    id: row.id,
+    ts: Number(row.ts),
+    server: row.server,
+    tool: row.tool,
+    accountLabel: row.account_label,
+    manifestId: row.manifest_id ?? null,
+    objectHash: row.object_hash ?? null,
+    userReply: row.user_reply,
+    checks: row.checks ?? {},
+    outcome: row.outcome,
+    refusalReason: row.refusal_reason ?? null,
+    actor: row.actor,
+    postVerifyResult: row.post_verify_result ?? null,
+    error: row.error ?? null,
+    preSnapshot: row.pre_snapshot ?? null,
+  }));
+}
+
+/** Total rows matching `filters` (ignoring limit/offset) — lets `docs_consent_audit`
+ * say "shown 20 of 143" honestly (limits-audit.md §10.1: silent truncation is
+ * never allowed) and tell the caller whether another page exists. */
+export async function countConsentAudit(filters: ConsentAuditFilters): Promise<number> {
+  const p = getPool();
+  const { where, params } = buildAuditWhere(filters);
+  const res = await p.query(`SELECT COUNT(*)::int AS n FROM consent_audit WHERE ${where}`, params);
+  return res.rows[0]?.n ?? 0;
 }
 
 export { randomUUID };

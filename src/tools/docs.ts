@@ -22,6 +22,7 @@ import {
 // far as this context object but is NOT yet passed into any `requireConsent()`
 // call below — that last step needs consent.ts to accept it first.
 import type { TgApprovalGate } from "../tg_approval.js";
+import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 
 /** One row of the shared consent_audit log, as read by `docs_consent_audit`.
  * Mirrors store.ts's `ConsentAuditRow` structurally — same "don't import
@@ -403,6 +404,441 @@ async function postVerifyRawBatchApplied(g: GoogleClients, documentId: string): 
   };
 }
 
+/** Достаёт человекочитаемый текст из CallToolResult — тот же текст, что
+ * увидела бы модель, для отчёта в Telegram (см. autoExecute.ts's ExecuteFn).
+ * Портировано с gmail-mcp/src/tools/gmail.ts's `extractText`. */
+function extractText(result: ReturnType<typeof ok>): string {
+  const first = result.content?.[0];
+  return first && first.type === "text" ? first.text : JSON.stringify(result);
+}
+
+/** Оборачивает rehash-функцию с реальным биндингом (принимает `g` явно) в
+ * `RehashFn`-совместимую форму для `registerAutoExecutor` — резолвит `g` из
+ * `ctx.clients.resolve(account)`, `account` берётся из самого `addressing`.
+ * Портировано с gmail-mcp/src/tools/gmail.ts's `autoRehash`. */
+function autoRehash<P extends { account: string }>(
+  core: (g: GoogleClients, addressing: P) => string | Promise<string>,
+): (addressing: unknown, ctx: AutoExecutorCtx) => string | Promise<string> {
+  return (addressing, ctx) => {
+    const p = addressing as P;
+    return core(ctx.clients.resolve(p.account), p);
+  };
+}
+
+// ── docs_create — payload/ядро исполнения (модульный уровень, см.
+// autoExecute.ts's doc-comment: реестр авто-исполнителей строится ПРИ
+// ИМПОРТЕ модуля, а не внутри registerDocsTools, которая вызывается
+// повторно на каждый MCP-запрос) ───────────────────────────────────────────
+interface CreateDocItem {
+  title: string;
+  initialText?: string;
+}
+interface CreatePayload {
+  account: string;
+  documents: CreateDocItem[];
+}
+
+/**
+ * Ядро исполнения `docs_create` — вынесено из тела тула (Максим, 2026-08-05),
+ * чтобы БЫТЬ ВЫЗЫВАЕМЫМ И ИЗ обычного MCP tool-хендлера (модель вызвала
+ * execute второй раз), И ИЗ фонового авто-поллера (кнопка в Telegram сама
+ * триггерит это, без участия модели вообще) — см. `autoExecute.ts`'s
+ * doc-comment про то, почему это НЕ MCP-параметр, а отдельная функция.
+ * Ничего в самой логике не изменилось — просто извлечена в функцию.
+ */
+async function executeCreateBatchCore(
+  g: GoogleClients,
+  payload: CreatePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<ReturnType<typeof ok>> {
+  const results = await Promise.all(
+    payload.documents.map(async ({ title, initialText }) => {
+      try {
+        const created = await g.docs.documents.create({
+          requestBody: { title },
+        });
+        const documentId = created.data.documentId!;
+        if (initialText) {
+          await g.docs.documents.batchUpdate({
+            documentId,
+            requestBody: {
+              requests: [{ insertText: { location: { index: 1 }, text: initialText } }],
+            },
+          });
+        }
+        return {
+          documentId,
+          title: created.data.title ?? title,
+          documentUrl: `https://docs.google.com/document/d/${documentId}/edit`,
+        };
+      } catch (err: unknown) {
+        return {
+          documentId: "",
+          title,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }),
+  );
+
+  return buildMutationResult({
+    results,
+    total: payload.documents.length,
+    verb: "Created",
+    summaryIcon: "📄",
+    verify: (r) => postVerifyDocCreated(g, r.documentId, r.title, r.title),
+    reportTitle: "Независимая проверка создания",
+    reportSubtitle: "запрошено ⇄ живое состояние Google Docs",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("docs_create", {
+  // Degenerate binding (документированное исключение, как и gmail_send в
+  // gmail-mcp/src/tools/gmail.ts): документ, который ещё не существует, не
+  // имеет живого объекта для перечитывания — единственная защита в том, что
+  // payload берётся ИЗ манифеста, а не из аргументов execute-вызова.
+  rehash: (addressing) => sha256(addressing),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as CreatePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeCreateBatchCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── docs_append_text — payload/ядро исполнения (модульный уровень) ─────────
+interface AppendItem {
+  documentId: string;
+  text: string;
+  ensureNewline?: boolean;
+}
+interface AppendPayload {
+  account: string;
+  items: AppendItem[];
+}
+
+/** Rehash с реальным биндингом: перечитывает живые документы (title/
+ * revisionId/text) — та же функция используется и в requireConsent's
+ * `rehash` (per-request, `g` из замыкания), и в `registerAutoExecutor` через
+ * `autoRehash` (module-level, `g` из `ctx.clients.resolve`) — общая функция,
+ * а не дублированная логика, гарантирует, что binding-проверка идентична в
+ * обоих путях. */
+async function rehashAppendBatch(g: GoogleClients, addressing: AppendPayload): Promise<string> {
+  const snapshot = await docBindingSnapshot(g, addressing.items);
+  return sha256({
+    account: addressing.account,
+    items: snapshot.map((s) => ({
+      documentId: s.documentId,
+      title: s.snap?.title ?? null,
+      revisionId: s.snap?.revisionId ?? null,
+      text: s.snap?.text ?? null,
+    })),
+  });
+}
+
+/** Ядро исполнения `docs_append_text` — вынесено из тела тула (Максим,
+ * 2026-08-05), см. `executeCreateBatchCore`'s doc-comment выше для причины. */
+async function executeAppendBatchCore(
+  g: GoogleClients,
+  payload: AppendPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<ReturnType<typeof ok>> {
+  const results: Array<{ documentId: string; addedLength?: number; error?: string }> = [];
+  for (const item of payload.items) {
+    const { documentId, text, ensureNewline } = item;
+    try {
+      const doc = await g.docs.documents.get({ documentId });
+      let insertText = text;
+      if (ensureNewline) {
+        const current = documentToPlainText(doc.data);
+        if (current.length > 0 && !current.endsWith("\n")) {
+          insertText = "\n" + text;
+        }
+      }
+      const index = documentEndIndex(doc.data);
+      await g.docs.documents.batchUpdate({
+        documentId,
+        requestBody: {
+          requests: [{ insertText: { location: { index }, text: insertText } }],
+        },
+      });
+      results.push({ documentId, addedLength: insertText.length });
+    } catch (err: unknown) {
+      results.push({
+        documentId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Appended",
+    summaryIcon: "📝",
+    verify: (r) => postVerifyDocContains(g, r.documentId, payload.items.find((it) => it.documentId === r.documentId)?.text ?? "", r.documentId),
+    reportTitle: "Независимая проверка добавления текста",
+    reportSubtitle: "запрошено ⇄ живое содержимое Google Docs",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("docs_append_text", {
+  rehash: autoRehash(rehashAppendBatch),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as AppendPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeAppendBatchCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── docs_insert_text — payload/ядро исполнения (модульный уровень) ─────────
+interface InsertItem {
+  documentId: string;
+  text: string;
+  index: number;
+}
+interface InsertPayload {
+  account: string;
+  items: InsertItem[];
+}
+
+async function rehashInsertBatch(g: GoogleClients, addressing: InsertPayload): Promise<string> {
+  const snapshot = await docBindingSnapshot(g, addressing.items);
+  return sha256({
+    account: addressing.account,
+    items: snapshot.map((s) => ({
+      documentId: s.documentId,
+      title: s.snap?.title ?? null,
+      revisionId: s.snap?.revisionId ?? null,
+      text: s.snap?.text ?? null,
+    })),
+  });
+}
+
+/** Ядро исполнения `docs_insert_text` — вынесено из тела тула (Максим,
+ * 2026-08-05), см. `executeCreateBatchCore`'s doc-comment выше для причины. */
+async function executeInsertBatchCore(
+  g: GoogleClients,
+  payload: InsertPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<ReturnType<typeof ok>> {
+  const results: Array<{ documentId: string; error?: string }> = [];
+  for (const item of payload.items) {
+    const { documentId, text, index } = item;
+    try {
+      await g.docs.documents.batchUpdate({
+        documentId,
+        requestBody: {
+          requests: [{ insertText: { location: { index }, text } }],
+        },
+      });
+      results.push({ documentId });
+    } catch (err: unknown) {
+      results.push({
+        documentId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Inserted",
+    summaryIcon: "📝",
+    verify: (r) => postVerifyDocContains(g, r.documentId, payload.items.find((it) => it.documentId === r.documentId)?.text ?? "", r.documentId),
+    reportTitle: "Независимая проверка вставки текста",
+    reportSubtitle: "запрошено ⇄ живое содержимое Google Docs",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("docs_insert_text", {
+  rehash: autoRehash(rehashInsertBatch),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as InsertPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeInsertBatchCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── docs_replace_text — payload/ядро исполнения (модульный уровень) ────────
+interface ReplaceItem {
+  documentId: string;
+  find: string;
+  replace: string;
+  matchCase?: boolean;
+}
+interface ReplacePayload {
+  account: string;
+  items: ReplaceItem[];
+}
+
+async function rehashReplaceBatch(g: GoogleClients, addressing: ReplacePayload): Promise<string> {
+  const snapshot = await replaceBindingSnapshot(g, addressing.items);
+  return sha256({
+    account: addressing.account,
+    items: snapshot.map(({ documentId, title, revisionId, matches }) => ({ documentId, title, revisionId, matches })),
+  });
+}
+
+/** Ядро исполнения `docs_replace_text` — вынесено из тела тула (Максим,
+ * 2026-08-05), см. `executeCreateBatchCore`'s doc-comment выше для причины. */
+async function executeReplaceBatchCore(
+  g: GoogleClients,
+  payload: ReplacePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<ReturnType<typeof ok>> {
+  // Pre-snapshot of the fragments about to be overwritten — captured FRESH
+  // right before the mutation (identity-postverify.md §5.2: replace_text is
+  // irreversible content-loss, so this is the only manual-recovery path).
+  const preSnapshot = await replaceBindingSnapshot(g, payload.items);
+  const results: Array<{
+    documentId: string;
+    occurrencesChanged?: number;
+    error?: string;
+  }> = [];
+  for (const item of payload.items) {
+    const { documentId, find, replace, matchCase } = item;
+    try {
+      const res = await g.docs.documents.batchUpdate({
+        documentId,
+        requestBody: {
+          requests: [
+            {
+              replaceAllText: {
+                containsText: { text: find, matchCase: matchCase ?? false },
+                replaceText: replace,
+              },
+            },
+          ],
+        },
+      });
+      const occurrencesChanged =
+        res.data.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
+      results.push({ documentId, occurrencesChanged });
+    } catch (err: unknown) {
+      results.push({
+        documentId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Replaced",
+    summaryIcon: "🔄",
+    verify: (r) => {
+      const it = payload.items.find((x) => x.documentId === r.documentId)!;
+      return postVerifyReplaceApplied(g, r.documentId, it.find, it.replace, it.matchCase ?? false);
+    },
+    reportTitle: "Независимая проверка замены",
+    reportSubtitle: "запрошено ⇄ живое содержимое Google Docs",
+    consentStore,
+    auditId,
+    preSnapshot,
+  });
+}
+
+registerAutoExecutor("docs_replace_text", {
+  rehash: autoRehash(rehashReplaceBatch),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as ReplacePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeReplaceBatchCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── docs_raw_batch_update — payload/ядро исполнения (модульный уровень) ────
+interface RawBatchItem {
+  documentId: string;
+  requests: object[];
+}
+interface RawBatchPayload {
+  account: string;
+  items: RawBatchItem[];
+}
+
+async function rehashRawBatchBatch(g: GoogleClients, addressing: RawBatchPayload): Promise<string> {
+  const snapshot = await docBindingSnapshot(g, addressing.items);
+  return sha256({
+    account: addressing.account,
+    items: snapshot.map((s) => ({
+      documentId: s.documentId,
+      title: s.snap?.title ?? null,
+      revisionId: s.snap?.revisionId ?? null,
+      text: s.snap?.text ?? null,
+    })),
+    requests: addressing.items.map((it) => it.requests),
+  });
+}
+
+/** Ядро исполнения `docs_raw_batch_update` — вынесено из тела тула (Максим,
+ * 2026-08-05), см. `executeCreateBatchCore`'s doc-comment выше для причины. */
+async function executeRawBatchBatchCore(
+  g: GoogleClients,
+  payload: RawBatchPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<ReturnType<typeof ok>> {
+  const results: Array<{
+    documentId: string;
+    replies?: unknown;
+    error?: string;
+  }> = [];
+  for (const item of payload.items) {
+    const { documentId, requests } = item;
+    try {
+      const res = await g.docs.documents.batchUpdate({
+        documentId,
+        requestBody: { requests: requests as object[] },
+      });
+      results.push({ documentId, replies: res.data.replies });
+    } catch (err: unknown) {
+      results.push({
+        documentId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Applied",
+    summaryIcon: "⚙️",
+    verify: (r) => postVerifyRawBatchApplied(g, r.documentId),
+    reportTitle: "Независимая проверка raw batchUpdate",
+    reportSubtitle: "запрошено ⇄ доступность документа (содержимое не проверяется — честный предел)",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("docs_raw_batch_update", {
+  rehash: autoRehash(rehashRawBatchBatch),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as RawBatchPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeRawBatchBatchCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
 export function registerDocsTools(server: McpServer, clients: UserClients, ctx: DocsConsentContext = DEFAULT_CONSENT_CTX) {
   const account = accountField(clients);
 
@@ -485,15 +921,6 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
   );
 
   // ── docs_create ──────────────────────────────────────────────────────────
-  interface CreateDocItem {
-    title: string;
-    initialText?: string;
-  }
-  interface CreatePayload {
-    account: string;
-    documents: CreateDocItem[];
-  }
-
   server.registerTool(
     "docs_create",
     {
@@ -570,61 +997,11 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await Promise.all(
-        payload.documents.map(async ({ title, initialText }) => {
-          try {
-            const created = await g.docs.documents.create({
-              requestBody: { title },
-            });
-            const documentId = created.data.documentId!;
-            if (initialText) {
-              await g.docs.documents.batchUpdate({
-                documentId,
-                requestBody: {
-                  requests: [{ insertText: { location: { index: 1 }, text: initialText } }],
-                },
-              });
-            }
-            return {
-              documentId,
-              title: created.data.title ?? title,
-              documentUrl: `https://docs.google.com/document/d/${documentId}/edit`,
-            };
-          } catch (err: unknown) {
-            return {
-              documentId: "",
-              title,
-              error: err instanceof Error ? err.message : String(err),
-            };
-          }
-        }),
-      );
-
-      return buildMutationResult({
-        results,
-        total: payload.documents.length,
-        verb: "Created",
-        summaryIcon: "📄",
-        verify: (r) => postVerifyDocCreated(g, r.documentId, r.title, r.title),
-        reportTitle: "Независимая проверка создания",
-        reportSubtitle: "запрошено ⇄ живое состояние Google Docs",
-        consentStore,
-        auditId,
-      });
+      return executeCreateBatchCore(g, payload, auditId, consentStore);
     }),
   );
 
   // ── docs_append_text ─────────────────────────────────────────────────────
-  interface AppendItem {
-    documentId: string;
-    text: string;
-    ensureNewline?: boolean;
-  }
-  interface AppendPayload {
-    account: string;
-    items: AppendItem[];
-  }
-
   server.registerTool(
     "docs_append_text",
     {
@@ -703,78 +1080,18 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           });
           return { payload, objectHash, preview, batchSize: items.length };
         },
-        rehash: async (addressing) => {
-          const a = addressing as AppendPayload;
-          const snapshot = await docBindingSnapshot(g, a.items);
-          return sha256({
-            account: a.account,
-            items: snapshot.map((s) => ({
-              documentId: s.documentId,
-              title: s.snap?.title ?? null,
-              revisionId: s.snap?.revisionId ?? null,
-              text: s.snap?.text ?? null,
-            })),
-          });
-        },
+        rehash: (addressing) => rehashAppendBatch(g, addressing as AppendPayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results: Array<{ documentId: string; addedLength?: number; error?: string }> = [];
-      for (const item of payload.items) {
-        const { documentId, text, ensureNewline } = item;
-        try {
-          const doc = await g.docs.documents.get({ documentId });
-          let insertText = text;
-          if (ensureNewline) {
-            const current = documentToPlainText(doc.data);
-            if (current.length > 0 && !current.endsWith("\n")) {
-              insertText = "\n" + text;
-            }
-          }
-          const index = documentEndIndex(doc.data);
-          await g.docs.documents.batchUpdate({
-            documentId,
-            requestBody: {
-              requests: [{ insertText: { location: { index }, text: insertText } }],
-            },
-          });
-          results.push({ documentId, addedLength: insertText.length });
-        } catch (err: unknown) {
-          results.push({
-            documentId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Appended",
-        summaryIcon: "📝",
-        verify: (r) => postVerifyDocContains(g, r.documentId, payload.items.find((it) => it.documentId === r.documentId)?.text ?? "", r.documentId),
-        reportTitle: "Независимая проверка добавления текста",
-        reportSubtitle: "запрошено ⇄ живое содержимое Google Docs",
-        consentStore,
-        auditId,
-      });
+      return executeAppendBatchCore(g, payload, auditId, consentStore);
     }),
   );
 
   // ── docs_insert_text ─────────────────────────────────────────────────────
-  interface InsertItem {
-    documentId: string;
-    text: string;
-    index: number;
-  }
-  interface InsertPayload {
-    account: string;
-    items: InsertItem[];
-  }
-
   server.registerTool(
     "docs_insert_text",
     {
@@ -850,70 +1167,18 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           });
           return { payload, objectHash, preview, batchSize: items.length };
         },
-        rehash: async (addressing) => {
-          const a = addressing as InsertPayload;
-          const snapshot = await docBindingSnapshot(g, a.items);
-          return sha256({
-            account: a.account,
-            items: snapshot.map((s) => ({
-              documentId: s.documentId,
-              title: s.snap?.title ?? null,
-              revisionId: s.snap?.revisionId ?? null,
-              text: s.snap?.text ?? null,
-            })),
-          });
-        },
+        rehash: (addressing) => rehashInsertBatch(g, addressing as InsertPayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results: Array<{ documentId: string; error?: string }> = [];
-      for (const item of payload.items) {
-        const { documentId, text, index } = item;
-        try {
-          await g.docs.documents.batchUpdate({
-            documentId,
-            requestBody: {
-              requests: [{ insertText: { location: { index }, text } }],
-            },
-          });
-          results.push({ documentId });
-        } catch (err: unknown) {
-          results.push({
-            documentId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Inserted",
-        summaryIcon: "📝",
-        verify: (r) => postVerifyDocContains(g, r.documentId, payload.items.find((it) => it.documentId === r.documentId)?.text ?? "", r.documentId),
-        reportTitle: "Независимая проверка вставки текста",
-        reportSubtitle: "запрошено ⇄ живое содержимое Google Docs",
-        consentStore,
-        auditId,
-      });
+      return executeInsertBatchCore(g, payload, auditId, consentStore);
     }),
   );
 
   // ── docs_replace_text ────────────────────────────────────────────────────
-  interface ReplaceItem {
-    documentId: string;
-    find: string;
-    replace: string;
-    matchCase?: boolean;
-  }
-  interface ReplacePayload {
-    account: string;
-    items: ReplaceItem[];
-  }
-
   server.registerTool(
     "docs_replace_text",
     {
@@ -994,71 +1259,14 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           });
           return { payload, objectHash, preview, batchSize: items.length };
         },
-        rehash: async (addressing) => {
-          const a = addressing as ReplacePayload;
-          const snapshot = await replaceBindingSnapshot(g, a.items);
-          return sha256({
-            account: a.account,
-            items: snapshot.map(({ documentId, title, revisionId, matches }) => ({ documentId, title, revisionId, matches })),
-          });
-        },
+        rehash: (addressing) => rehashReplaceBatch(g, addressing as ReplacePayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      // Pre-snapshot of the fragments about to be overwritten — captured FRESH
-      // right before the mutation (identity-postverify.md §5.2: replace_text is
-      // irreversible content-loss, so this is the only manual-recovery path).
-      const preSnapshot = await replaceBindingSnapshot(g, payload.items);
-      const results: Array<{
-        documentId: string;
-        occurrencesChanged?: number;
-        error?: string;
-      }> = [];
-      for (const item of payload.items) {
-        const { documentId, find, replace, matchCase } = item;
-        try {
-          const res = await g.docs.documents.batchUpdate({
-            documentId,
-            requestBody: {
-              requests: [
-                {
-                  replaceAllText: {
-                    containsText: { text: find, matchCase: matchCase ?? false },
-                    replaceText: replace,
-                  },
-                },
-              ],
-            },
-          });
-          const occurrencesChanged =
-            res.data.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
-          results.push({ documentId, occurrencesChanged });
-        } catch (err: unknown) {
-          results.push({
-            documentId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Replaced",
-        summaryIcon: "🔄",
-        verify: (r) => {
-          const it = payload.items.find((x) => x.documentId === r.documentId)!;
-          return postVerifyReplaceApplied(g, r.documentId, it.find, it.replace, it.matchCase ?? false);
-        },
-        reportTitle: "Независимая проверка замены",
-        reportSubtitle: "запрошено ⇄ живое содержимое Google Docs",
-        consentStore,
-        auditId,
-        preSnapshot,
-      });
+      return executeReplaceBatchCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -1077,15 +1285,6 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
   // §15.1 Q20: an operation where generic post-verify is technically
   // impossible must be named up front) — see postVerifyRawBatchApplied above
   // and GUIDE.md.
-  interface RawBatchItem {
-    documentId: string;
-    requests: object[];
-  }
-  interface RawBatchPayload {
-    account: string;
-    items: RawBatchItem[];
-  }
-
   server.registerTool(
     "docs_raw_batch_update",
     {
@@ -1168,58 +1367,14 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           });
           return { payload, objectHash, preview, batchSize: items.length };
         },
-        rehash: async (addressing) => {
-          const a = addressing as RawBatchPayload;
-          const snapshot = await docBindingSnapshot(g, a.items);
-          return sha256({
-            account: a.account,
-            items: snapshot.map((s) => ({
-              documentId: s.documentId,
-              title: s.snap?.title ?? null,
-              revisionId: s.snap?.revisionId ?? null,
-              text: s.snap?.text ?? null,
-            })),
-            requests: a.items.map((it) => it.requests),
-          });
-        },
+        rehash: (addressing) => rehashRawBatchBatch(g, addressing as RawBatchPayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results: Array<{
-        documentId: string;
-        replies?: unknown;
-        error?: string;
-      }> = [];
-      for (const item of payload.items) {
-        const { documentId, requests } = item;
-        try {
-          const res = await g.docs.documents.batchUpdate({
-            documentId,
-            requestBody: { requests: requests as object[] },
-          });
-          results.push({ documentId, replies: res.data.replies });
-        } catch (err: unknown) {
-          results.push({
-            documentId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Applied",
-        summaryIcon: "⚙️",
-        verify: (r) => postVerifyRawBatchApplied(g, r.documentId),
-        reportTitle: "Независимая проверка raw batchUpdate",
-        reportSubtitle: "запрошено ⇄ доступность документа (содержимое не проверяется — честный предел)",
-        consentStore,
-        auditId,
-      });
+      return executeRawBatchBatchCore(g, payload, auditId, consentStore);
     }),
   );
 

@@ -15,6 +15,7 @@ import {
   listApprovedUnexecuted,
 } from "./store.js";
 import { renderDashboard } from "./dashboard.js";
+import { logDashboardLocation } from "./logRedaction.js";
 import { buildUserClients } from "./accounts.js";
 import { handleWebhook, registerWebhook, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
 import { tryAutoExecute } from "./consent.js";
@@ -312,7 +313,9 @@ export async function startHttpServer(config: Config): Promise<void> {
         res.redirect(`${base}?msg=${ok ? "renamed" : "rename_failed"}`);
       });
 
-      console.error(`Account dashboard at ${baseUrl}${base}`);
+      // #119: НЕ печатать сам секрет — он же пароль от дашборда, а логи
+      // Railway видит каждый, у кого есть доступ к проекту.
+      logDashboardLocation(baseUrl, base, dashSecret);
     }
 
     console.error(`Native MCP OAuth enabled — clients connect and authorize directly at ${baseUrl}/mcp`);

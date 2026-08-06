@@ -15,14 +15,22 @@ import {
   type ConsentStore,
   type ConsentConfig,
 } from "../consent.js";
-// TgApprovalGate comes from tg_approval.js, NOT consent.js, because docs-mcp's
-// consent.ts does not yet declare its own `tg?: TgApprovalGate` field/type
-// (unlike gmail-mcp's, which this module was ported from — see server.ts's
-// import note for the same caveat). `ctx.tg` below is therefore plumbed as
-// far as this context object but is NOT yet passed into any `requireConsent()`
-// call below — that last step needs consent.ts to accept it first.
+// `TgApprovalGate` берётся из tg_approval.js; consent.ts объявляет свой
+// структурно идентичный интерфейс с тем же именем (он не импортирует
+// tg_approval.ts, чтобы оставаться переносимым побайтово) — оба подходят.
+// `ctx.tg` реально передаётся в КАЖДЫЙ `requireConsent()` ниже; комментарий
+// здесь до 2026-08-06 утверждал обратное, и это было неправдой.
 import type { TgApprovalGate } from "../tg_approval.js";
-import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
+import { registerAutoExecutor, getAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
+
+/**
+ * «Умеет ли сервер исполнить план этого тула сам, по нажатию кнопки» — второе
+ * условие button-only режима (consent.ts's `tgButtonOnly`). Правило ПО
+ * СВОЙСТВУ, а не список имён: как только у тула появляется авто-исполнитель,
+ * он автоматически становится button-only; забыли исполнитель — просто
+ * остаётся открыт обычный текстовый путь (мягкая деградация).
+ */
+const hasAutoExecutor = (tool: string): boolean => getAutoExecutor(tool) !== undefined;
 
 /** One row of the shared consent_audit log, as read by `docs_consent_audit`.
  * Mirrors store.ts's `ConsentAuditRow` structurally — same "don't import
@@ -83,10 +91,11 @@ export interface DocsConsentContext {
    * Optional out-of-band Telegram-button approval gate (plan-tg-approval.md),
    * ported from gmail-mcp. Always constructed in server.ts (never undefined
    * in production), `enabledFor()` simply false when TG_APPROVAL_ENABLED is
-   * unset — a fork without a configured bot is unaffected. NOT YET wired into
-   * the `requireConsent()` calls below: consent.ts here doesn't accept a `tg`
-   * param yet (see this file's top import note). Optional field so existing
-   * callers/tests that build a `DocsConsentContext` without it keep compiling.
+   * unset — a fork without a configured bot is unaffected. Wired into EVERY
+   * `requireConsent()` call below (`tg`), и через него — в button-only режим.
+   * Optional field so existing callers/tests that build a
+   * `DocsConsentContext` without it keep compiling (для них слой просто
+   * выключен).
    */
   tg?: TgApprovalGate;
 }
@@ -984,6 +993,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        hasAutoExecutor,
         plan: () => {
           if (!documents || !documents.length) {
             throw new Error("Нужен непустой `documents`, чтобы построить план создания.");
@@ -1069,6 +1079,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        hasAutoExecutor,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план добавления текста.");
@@ -1156,6 +1167,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        hasAutoExecutor,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план вставки текста.");
@@ -1244,6 +1256,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        hasAutoExecutor,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план замены.");
@@ -1350,6 +1363,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        hasAutoExecutor,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужны непустой `items`, чтобы построить план.");

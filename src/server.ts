@@ -4,17 +4,11 @@ import { loadConsentGateConfig, loadTgApprovalConfig } from "./config.js";
 import { buildUserClients, registerAccountTools } from "./accounts.js";
 import { registerDocsTools, type DocsConsentContext } from "./tools/docs.js";
 import type { ConsentStore, ConsentConfig } from "./consent.js";
-// NOTE (deviation from the gmail-mcp source this was ported from): gmail-mcp's
-// own consent.ts already declares a `TgApprovalGate` interface (added there
-// alongside the `tg?: TgApprovalGate` field on `RequireConsentParams` — see
-// that file's doc-comment on why it's duplicated rather than imported from
-// this module). docs-mcp's consent.ts does NOT have that field/type yet (this
-// port was explicitly told not to touch consent.ts — see the port's task
-// notes). tg_approval.ts exports its own structurally-identical copy of
-// `TgApprovalGate` for exactly this DI reason, so importing it from there
-// works today; once consent.ts gains its own `tg?: TgApprovalGate` field
-// (a follow-up requiring Maksim's sign-off), this import can switch back to
-// "./consent.js" to match gmail-mcp exactly.
+// `TgApprovalGate` берётся из tg_approval.ts, хотя consent.ts объявляет
+// СТРУКТУРНО ИДЕНТИЧНЫЙ интерфейс с тем же именем (consent.ts не импортирует
+// tg_approval.ts, чтобы оставаться переносимым побайтово). Объект, который
+// возвращает `createTgApprovalGate`, удовлетворяет обоим; какой из двух
+// импортировать здесь — вопрос вкуса, а не возможностей.
 import type { TgApprovalStore, TgApprovalGate } from "./tg_approval.js";
 import { createTgApprovalGate } from "./tg_approval.js";
 import {
@@ -23,6 +17,7 @@ import {
   getManifest,
   consumeManifest,
   invalidateManifest,
+  markTgNotified,
   appendConsentAudit,
   updateConsentAuditOutcome,
   listConsentAudit,
@@ -44,6 +39,7 @@ export const consentStoreAdapter: ConsentStore = {
   getManifest,
   consumeManifest,
   invalidateManifest,
+  markTgNotified,
   appendConsentAudit,
   updateConsentAuditOutcome,
 };
@@ -98,11 +94,12 @@ export const tgApprovalStoreAdapter: TgApprovalStore = {
  * unless `enabledFor(tool)` says so, and that itself is always false when
  * disabled — regardless of whether Postgres is configured at all.
  *
- * NOT YET actually threaded into `requireConsent()` calls in tools/docs.ts —
- * consent.ts here doesn't accept a `tg` param yet (see the import note atop
- * this file). `consentCtx.tg` below carries it as far as the context object;
- * the last wiring step is deliberately left undone pending that consent.ts
- * change.
+ * Реально прокинут в `requireConsent({ tg })` во ВСЕХ пяти гейтованных тулах
+ * (`src/tools/docs.ts`), а через него — и в button-only режим (consent.ts's
+ * `tgButtonOnly`). Комментарий здесь до 2026-08-06 утверждал обратное («NOT
+ * YET actually threaded… the last wiring step is deliberately left undone») —
+ * это было неправдой уже на момент написания и стоило репозиторию половины
+ * перенесённых тестов.
  */
 export const tgApprovalGate: TgApprovalGate = createTgApprovalGate(tgApprovalConfig, tgApprovalStoreAdapter);
 

@@ -1,0 +1,34 @@
+name: Typecheck and tests
+
+# Проверка полноты защиты (scripts/test-gate-coverage.mjs) — то, что не даёт
+# write-инструменту уехать в прод без consent-гейта. До 2026-08-06 её в CI не
+# гонял НИКТО: в .github/workflows лежали только guide.yml и sync-upstream.yml,
+# а `npm test` не запускался вообще — при том что собственный комментарий той
+# проверки утверждал, что «новый метод без подтверждения сломает сборку». Это
+# было неправдой, и такая неправда усыпляет сильнее, чем отсутствие проверки.
+#
+# То же касается строгого протокола подтверждения (test-consent-strict.mjs) и
+# button-only (test-button-only.mjs). Всё offline: ни сети (кроме loopback), ни
+# секретов, ни базы — Google/Telegram клиенты замоканы, Postgres подменён
+# in-memory фейком.
+#
+# Имя файла совпадает с остальными MCP-репозиториями Максима (gmail/drive/
+# sheets/calendar-mcp) — единообразие важнее краткости.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

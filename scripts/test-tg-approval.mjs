@@ -12,16 +12,21 @@
  * generic tg_approval.ts module, copied verbatim). Only server label
  * ("gmail" → "docs") and the stand-in tool/payload names differ.
  *
- * ВАЖНО (расхождение с gmail-mcp на момент портирования): docs-mcp's
- * `src/consent.ts` ЕЩЁ НЕ содержит поле `tg?: TgApprovalGate` и ветки
- * `if (p.tg?.enabledFor(tool))` внутри `requireConsent()` — этого потребовал
- * бы полный перенос (gmail-mcp's consent.ts их уже содержит), но правка
- * consent.ts была явно исключена из объёма этого порта (нужно отдельное
- * одобрение Максима). Поэтому секции [1] пройдёт (poведение с `tg` не
- * отличается от его отсутствия, что верно ДАЖЕ без интеграции в consent.ts),
- * а секции [2]-[7b] (которые проверяют, что requireConsent() РЕАЛЬНО
- * обращается к `tg`) ожидаемо КРАСНЫЕ — это фиксирует незавершённость
- * интеграции, а не баг в tg_approval.ts самом по себе.
+ * ⚠️ ИСПРАВЛЕНИЕ ВРУЩЕГО КОММЕНТАРИЯ (2026-08-06). Здесь стояло: «docs-mcp's
+ * src/consent.ts ЕЩЁ НЕ содержит поле `tg?: TgApprovalGate` и ветки
+ * `if (p.tg?.enabledFor(tool))`… секции [2]-[7b] ожидаемо КРАСНЫЕ». Это было
+ * НЕПРАВДОЙ: consent.ts содержит и поле, и ветки, `tg` прокинут во все пять
+ * гейтованных тулов, а весь файл проходил зелёным. Такие «честные оговорки»
+ * ровно и приводят к тому, что следующий подход к репозиторию не переносит
+ * половину защит, считая слой неподключённым.
+ *
+ * Что здесь НЕ проверяется, честно: button-only режим (consent.ts's
+ * `tgButtonOnly` — «план ушёл кнопкой ⇒ текстовый путь закрыт»). Он живёт в
+ * отдельном файле `scripts/test-button-only.mjs`, потому что включается
+ * только когда вызывающий передал `hasAutoExecutor`; здесь `hasAutoExecutor`
+ * НЕ передаётся нигде, поэтому сценарии ниже намеренно описывают СТАРУЮ
+ * двухфакторную схему (кнопка + текстовое «да»), которая продолжает работать
+ * для планов без авто-исполнителя.
  *
  * Запуск: node scripts/test-tg-approval.mjs
  */
@@ -97,6 +102,11 @@ function makeConsentStore() {
         r.status = "INVALIDATED";
         r.userReply = userReply;
       }
+    },
+    // Зеркалит store.ts's `markTgNotified` — UPDATE ... SET tg_notified = TRUE.
+    async markTgNotified(id, server) {
+      const r = manifests.get(id);
+      if (r && r.server === server) r.tgNotified = true;
     },
     async appendConsentAudit(entry) {
       audits.push({ ...entry });
@@ -250,7 +260,24 @@ let planCtx; // переиспользуем в [4]/[5]/[6]/[7]
   const dec = await requireConsent({ tool: "docs_create", accountLabel: "work", plan, rehash, store: consentStore, cfg: consentCfg, tg: gate });
 
   check("kind=planned", dec.kind === "planned");
-  check("превью упоминает Telegram И «да» здесь", /Telegram/.test(dec.preview) && /да/.test(dec.preview));
+  // Раньше здесь проверялось `/да/.test(preview)` — ФИКТИВНАЯ проверка:
+  // подстрока «да» случайно есть в слове «Соз-да-ние» из заголовка плана, так
+  // что она была истинной при любом тексте приписки. Проверяем по смыслу:
+  // приписка просит нажать КНОПКУ, и (так как авто-исполнителя у этого вызова
+  // нет — `hasAutoExecutor` не передан) честно говорит, что после нажатия
+  // нужно повторить вызов инструмента.
+  check("превью упоминает Telegram", /Telegram/.test(dec.preview), dec.preview);
+  check("превью просит нажать кнопку", /кнопкой/i.test(dec.preview), dec.preview);
+  check(
+    "без авто-исполнителя приписка честно просит ПОВТОРИТЬ вызов инструмента",
+    /повторите вызов инструмента/i.test(dec.preview),
+    dec.preview,
+  );
+  check(
+    "приписка НЕ обещает автоисполнение (авто-исполнителя нет)",
+    !/выполнится автоматически/i.test(dec.preview),
+    dec.preview,
+  );
   const row = tgStore.approvals.get(dec.manifestId);
   check("tg_approvals содержит PENDING-строку с этим manifestId", !!row && row.status === "PENDING");
   // Guarded (unlike gmail-mcp's original): without consent.ts's `tg` wiring

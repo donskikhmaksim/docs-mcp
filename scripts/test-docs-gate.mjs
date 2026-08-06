@@ -120,6 +120,11 @@ async function harness(world) {
         r.userReply = userReply;
       }
     },
+    // Контракт ConsentStore (2026-08-06): метка «план ушёл кнопкой».
+    async markTgNotified(id, server) {
+      const r = manifests.get(id);
+      if (r && r.server === server) r.tgNotified = true;
+    },
     async appendConsentAudit(entry) {
       audits.push({ ...entry });
     },

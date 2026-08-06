@@ -137,6 +137,15 @@ export async function ensureSchema(): Promise<void> {
   await p.query(
     `CREATE INDEX IF NOT EXISTS consent_manifests_cleanup_idx ON consent_manifests (server, status, expires_at)`,
   );
+  // Миграция (2026-08-06, button-only): «этот план реально ушёл в Telegram с
+  // кнопками». ADD COLUMN IF NOT EXISTS — таблица общая на 5 серверов, каждый
+  // из них выполняет ensureSchema() при старте, поэтому колонку может добавить
+  // любой из них первым, и повторный вызов обязан быть безобидным. DEFAULT
+  // FALSE ⇒ все существующие планы остаются «не помеченными» = поведение как
+  // раньше (см. consent.ts's `tgButtonOnly`).
+  await p.query(
+    `ALTER TABLE consent_manifests ADD COLUMN IF NOT EXISTS tg_notified BOOLEAN NOT NULL DEFAULT FALSE`,
+  );
   // Append-only audit trail. Written in two phases (plan §0.4/[R:полнота-3]):
   // appendConsentAudit() at the gate DECISION (confirmed/refused/invalidated),
   // then updateConsentAuditOutcome() fills in what the MUTATION actually did
@@ -508,6 +517,10 @@ export interface ConsentManifestRow {
   expiresAt: number;
   consumedAt?: number | null;
   userReply?: string | null;
+  /** «План ушёл в Telegram с кнопками» — см. `markTgNotified` ниже и
+   * consent.ts's `tgButtonOnly`. Структурно совпадает с одноимённым полем в
+   * consent.ts's `ConsentManifestRow` (store.ts не импортирует consent.ts). */
+  tgNotified?: boolean;
 }
 
 export interface ConsentAuditEntry {
@@ -537,6 +550,7 @@ function rowToManifest(row: {
   expires_at: string | number;
   consumed_at: string | number | null;
   user_reply: string | null;
+  tg_notified?: boolean | null;
 }): ConsentManifestRow {
   return {
     id: row.id,
@@ -550,7 +564,25 @@ function rowToManifest(row: {
     expiresAt: Number(row.expires_at),
     consumedAt: row.consumed_at === null ? null : Number(row.consumed_at),
     userReply: row.user_reply,
+    tgNotified: row.tg_notified === true,
   };
+}
+
+/**
+ * Помечает манифест как «план ушёл в Telegram с кнопками» (consent.ts's
+ * `ConsentStore.markTgNotified`). Пишется РОВНО из фазы плана `requireConsent`
+ * и только после успешной отправки сообщения — с этого момента факт «эта
+ * операция подтверждается кнопкой» живёт В СОСТОЯНИИ ПЛАНА и переживает и
+ * рестарт процесса, и выключение `TG_APPROVAL_ENABLED` (в отличие от
+ * Python-эталона, где манифесты лежат в RAM и рестарт между планом и нажатием
+ * теряет план целиком). Метка НИКОГДА не снимается.
+ */
+export async function markTgNotified(id: string, server: string): Promise<void> {
+  const p = getPool();
+  await p.query(`UPDATE consent_manifests SET tg_notified = TRUE WHERE id = $1 AND server = $2`, [
+    id,
+    server,
+  ]);
 }
 
 /** Inserts a new manifest in AWAITING_CONSENT. Opportunistically sweeps this

@@ -97,6 +97,8 @@ function makeConsentStore() {
       return null; // this test never confirms — only the plan phase is exercised
     },
     async invalidateManifest() {},
+    // Контракт ConsentStore (2026-08-06): метка «план ушёл кнопкой».
+    async markTgNotified() {},
     async appendConsentAudit() {},
     async updateConsentAuditOutcome() {},
   };

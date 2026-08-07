@@ -127,6 +127,15 @@ async function runHappyPath(tool, payload, seed, assertFn) {
   check("execute() не упал", !threw, threw ? String(threw) : "");
   if (threw) return;
   check("вернул непустую строку (текст отчёта)", typeof text === "string" && text.length > 0, JSON.stringify(text));
+  // Баг #131: этот текст уходит НАПРЯМУЮ в Telegram (editMessageText) без
+  // модели между сервером и чатом — если он окажется сырым JSON или будет
+  // содержать служебную инструкцию для модели, владелец увидит её как есть.
+  check(
+    "НЕ сырой JSON (не начинается с { — раньше это был JSON.stringify({summary, results, verification}))",
+    !text.trim().startsWith("{"),
+    text.slice(0, 120),
+  );
+  check("НЕ содержит служебную инструкцию для модели ('[агенту:')", !text.includes("[агенту:"), text);
   assertFn(calls, text, docs);
 }
 
@@ -139,6 +148,8 @@ await runHappyPath(
     check("documents.create вызван с правильным title", calls.create.length === 1 && calls.create[0].requestBody.title === "Q4 план");
     check("initialText вставлен через batchUpdate", calls.batchUpdate.length === 1);
     check("текст отчёта содержит ссылку на документ (documentUrl) — главный кейс фичи", text.includes("docs.google.com/document/d/"), text);
+    check("текст отчёта упоминает «Создано» (по-русски, не 'Created')", text.includes("Создано"), text);
+    check("текст отчёта называет документ по title, не по id", text.includes("Q4 план"), text);
   },
 );
 
@@ -150,7 +161,8 @@ await runHappyPath(
   (calls, text, docs) => {
     check("batchUpdate вызван для добавления", calls.batchUpdate.some((c) => c.documentId === "D1"));
     check("текст реально добавлен в живой документ", docs.get("D1").text.includes("добавленный текст"));
-    check("текст отчёта упоминает 'Appended'", text.includes("Appended"), text);
+    check("текст отчёта упоминает «Добавлено» (по-русски, не 'Appended')", text.includes("Добавлено"), text);
+    check("текст отчёта называет документ по title, не по id", text.includes("My Doc"), text);
   },
 );
 
@@ -162,7 +174,8 @@ await runHappyPath(
   (calls, text, docs) => {
     check("batchUpdate вызван для вставки", calls.batchUpdate.some((c) => c.documentId === "D1"));
     check("текст реально вставлен в живой документ", docs.get("D1").text.includes("вставленный текст"));
-    check("текст отчёта упоминает 'Inserted'", text.includes("Inserted"), text);
+    check("текст отчёта упоминает «Вставлено» (по-русски, не 'Inserted')", text.includes("Вставлено"), text);
+    check("текст отчёта называет документ по title, не по id", text.includes("My Doc"), text);
   },
 );
 
@@ -174,7 +187,8 @@ await runHappyPath(
   (calls, text, docs) => {
     check("batchUpdate вызван с replaceAllText", calls.batchUpdate.some((c) => c.requestBody.requests[0].replaceAllText));
     check("замена реально применена в живом документе", docs.get("D1").text.includes("new content"));
-    check("текст отчёта упоминает 'Replaced'", text.includes("Replaced"), text);
+    check("текст отчёта упоминает «Заменено» (по-русски, не 'Replaced')", text.includes("Заменено"), text);
+    check("текст отчёта называет документ по title, не по id", text.includes("My Doc"), text);
   },
 );
 
@@ -185,7 +199,8 @@ await runHappyPath(
   { D1: { title: "My Doc", text: "old content\n", revisionId: "rev-1" } },
   (calls, text) => {
     check("batchUpdate вызван с произвольным запросом", calls.batchUpdate.some((c) => c.documentId === "D1"));
-    check("текст отчёта упоминает 'Applied'", text.includes("Applied"), text);
+    check("текст отчёта упоминает «Применено» (по-русски, не 'Applied')", text.includes("Применено"), text);
+    check("текст отчёта называет документ по title, не по id", text.includes("My Doc"), text);
   },
 );
 

@@ -184,13 +184,47 @@ function renderVerifyReport(title: string, subtitle: string, results: VerifyLine
   const warnN = results.filter((r) => r.outcome === "warn").length;
   const mmN = results.filter((r) => r.outcome === "mismatch").length;
   const body = results.map((r) => r.line).join("\n");
+  // ВАЖНО (баг #131): раньше здесь была строка `_[агенту: перепечатай этот
+  // отчёт пользователю ДОСЛОВНО...]_` — служебная инструкция ДЛЯ МОДЕЛИ. Она
+  // работала, пока единственным потребителем этого текста была модель внутри
+  // обычного чата (та могла её "понять" и не печатать). Но тот же текст уходит
+  // и в путь авто-исполнения по кнопке в Telegram (`autoExecute.ts` → `extractText`
+  // → `reportAutoExecutionResult`), где НЕТ модели между сервером и Telegram —
+  // инструкция утекала владельцу буквально как часть сообщения. Раз текст
+  // теперь и так готовый человекочитаемый markdown (см. `renderMutationReport`
+  // ниже), инструкция больше не нужна ни одному потребителю — просто убрана.
   return (
     `### 🧾 ${title}\n` +
     `_${nowInLA()} · ${subtitle}_\n\n` +
     `${body}\n\n` +
-    `**Итог: ✅ ${okN} подтверждено, ⚠️ ${warnN} не проверено, ❌ ${mmN} расхождение.**\n` +
-    `_[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — это серверная проверка, не заменяй пересказом]_`
+    `**Итог: ✅ ${okN} подтверждено, ⚠️ ${warnN} не проверено, ❌ ${mmN} расхождение.**`
   );
+}
+
+/**
+ * Единый каркас человекочитаемого отчёта об исполнении (mcp-development-
+ * standard/references/output-format.md §7.1: заголовок → буллеты по объектам
+ * → приклеенный пруф-блок), ГОТОВЫЙ ТЕКСТ (не объект — раньше `buildMutationResult`
+ * возвращал `ok({summary, results, verification})`, а `ok()` на не-строке
+ * делает `JSON.stringify` — та самая сырая JSON-простыня, что улетала в
+ * Telegram при авто-исполнении по кнопке, баг #131). Один хелпер-обёртка на
+ * файл (output-format.md §7.1 п.5: тул, который лепит строку ответа руками, —
+ * дефект).
+ */
+function renderMutationReport(opts: {
+  icon: string;
+  verbRu: string;
+  okN: number;
+  total: number;
+  tail: string;
+  itemLines: string[];
+  verification?: string;
+}): ReturnType<typeof ok> {
+  const { icon, verbRu, okN, total, tail, itemLines, verification } = opts;
+  const header = `### ${icon} ${verbRu} ${okN}/${total}${tail}`;
+  const parts = [header, itemLines.join("\n")];
+  if (verification) parts.push(verification);
+  return ok(parts.join("\n\n"));
 }
 
 /**
@@ -204,16 +238,23 @@ function renderVerifyReport(title: string, subtitle: string, results: VerifyLine
 async function buildMutationResult<T extends { error?: string }>(opts: {
   results: T[];
   total: number;
+  /** Русский глагол в прошедшем времени для заголовка отчёта, например
+   * «Создано»/«Добавлено» (баг #131: раньше здесь были английские "Created"/
+   * "Appended" — единственное место, где они были видны Максиму). */
   verb: string;
   summaryIcon: string;
   verify: (item: T) => Promise<VerifyLine>;
+  /** Готовая строка-буллет ОДНОГО объекта (`- ✅ **«название»** — …` или
+   * `- ❌ **«название»** — ошибка: …`) — объекты называются, не id
+   * (output-format.md §7.1 п.2). */
+  renderItem: (item: T) => string;
   reportTitle: string;
   reportSubtitle: string;
   consentStore?: ConsentStore;
   auditId?: string;
   preSnapshot?: unknown;
 }): Promise<ReturnType<typeof ok>> {
-  const { results, total, verb, summaryIcon, verify, reportTitle, reportSubtitle, consentStore, auditId, preSnapshot } = opts;
+  const { results, total, verb, summaryIcon, verify, renderItem, reportTitle, reportSubtitle, consentStore, auditId, preSnapshot } = opts;
   const succeeded = results.filter((r) => !r.error);
   const pv = await mapWithLimit(succeeded, (r) => verify(r));
   const okN = succeeded.length;
@@ -245,10 +286,14 @@ async function buildMutationResult<T extends { error?: string }>(opts: {
         console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e));
       });
   }
-  return ok({
-    summary: `${icon} ${verb} ${okN}/${total}${tail}`,
-    results,
-    ...(pv.length ? { verification: renderVerifyReport(reportTitle, reportSubtitle, pv) } : {}),
+  return renderMutationReport({
+    icon,
+    verbRu: verb,
+    okN,
+    total,
+    tail,
+    itemLines: results.map(renderItem),
+    verification: pv.length ? renderVerifyReport(reportTitle, reportSubtitle, pv) : undefined,
   });
 }
 
@@ -455,7 +500,7 @@ async function executeCreateBatchCore(
   // mapWithLimit (cap 8, util.ts default) instead of unbounded Promise.all —
   // throttles a large batch's fan-out against Docs/Drive rate limits, matches
   // existing usage elsewhere in this file (Максим, fix/docs-throttle-and-output).
-  const results = await mapWithLimit(
+  const results: Array<{ documentId: string; title: string; documentUrl?: string; error?: string }> = await mapWithLimit(
     payload.documents,
     async ({ title, initialText }) => {
       try {
@@ -489,9 +534,13 @@ async function executeCreateBatchCore(
   return buildMutationResult({
     results,
     total: payload.documents.length,
-    verb: "Created",
+    verb: "Создано",
     summaryIcon: "📄",
     verify: (r) => postVerifyDocCreated(g, r.documentId, r.title, r.title),
+    renderItem: (r) =>
+      r.error
+        ? `- ❌ **«${safeText(r.title)}»** — ошибка: ${safeText(r.error, 200)}`
+        : `- ✅ **«${safeText(r.title)}»** — ${r.documentUrl}`,
     reportTitle: "Независимая проверка создания",
     reportSubtitle: "запрошено ⇄ живое состояние Google Docs",
     consentStore,
@@ -551,7 +600,7 @@ async function executeAppendBatchCore(
   auditId: string,
   consentStore: ConsentStore,
 ): Promise<ReturnType<typeof ok>> {
-  const results: Array<{ documentId: string; addedLength?: number; error?: string }> = [];
+  const results: Array<{ documentId: string; title?: string | null; addedLength?: number; error?: string }> = [];
   for (const item of payload.items) {
     const { documentId, text, ensureNewline } = item;
     try {
@@ -570,7 +619,11 @@ async function executeAppendBatchCore(
           requests: [{ insertText: { location: { index }, text: insertText } }],
         },
       });
-      results.push({ documentId, addedLength: insertText.length });
+      // title уже пришёл бесплатно вместе с documents.get() выше (нужен был
+      // для documentToPlainText/documentEndIndex) — просто сохраняем его для
+      // человекочитаемой строки отчёта (output-format.md §7.1 п.2: объекты
+      // называются, не id).
+      results.push({ documentId, title: doc.data.title ?? null, addedLength: insertText.length });
     } catch (err: unknown) {
       results.push({
         documentId,
@@ -582,9 +635,13 @@ async function executeAppendBatchCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Appended",
+    verb: "Добавлено",
     summaryIcon: "📝",
     verify: (r) => postVerifyDocContains(g, r.documentId, payload.items.find((it) => it.documentId === r.documentId)?.text ?? "", r.documentId),
+    renderItem: (r) =>
+      r.error
+        ? `- ❌ **«${safeText(r.title ?? r.documentId)}»** — ошибка: ${safeText(r.error, 200)}`
+        : `- ✅ **«${safeText(r.title ?? r.documentId)}»** — добавлено ${r.addedLength} симв.`,
     reportTitle: "Независимая проверка добавления текста",
     reportSubtitle: "запрошено ⇄ живое содержимое Google Docs",
     consentStore,
@@ -634,17 +691,23 @@ async function executeInsertBatchCore(
   auditId: string,
   consentStore: ConsentStore,
 ): Promise<ReturnType<typeof ok>> {
-  const results: Array<{ documentId: string; error?: string }> = [];
+  const results: Array<{ documentId: string; title?: string | null; error?: string }> = [];
   for (const item of payload.items) {
     const { documentId, text, index } = item;
     try {
+      // Отдельный live-read title'а (в отличие от append, здесь до этого не
+      // было ни одного get() — insert не нуждается в содержимом документа для
+      // самой вставки). Стоит одного лишнего запроса к Docs API за батч-элемент,
+      // но без него строка отчёта показывала бы голый documentId, что
+      // запрещено output-format.md §7.1 п.2 (объекты называются, не id).
+      const doc = await g.docs.documents.get({ documentId });
       await g.docs.documents.batchUpdate({
         documentId,
         requestBody: {
           requests: [{ insertText: { location: { index }, text } }],
         },
       });
-      results.push({ documentId });
+      results.push({ documentId, title: doc.data.title ?? null });
     } catch (err: unknown) {
       results.push({
         documentId,
@@ -656,9 +719,13 @@ async function executeInsertBatchCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Inserted",
+    verb: "Вставлено",
     summaryIcon: "📝",
     verify: (r) => postVerifyDocContains(g, r.documentId, payload.items.find((it) => it.documentId === r.documentId)?.text ?? "", r.documentId),
+    renderItem: (r) =>
+      r.error
+        ? `- ❌ **«${safeText(r.title ?? r.documentId)}»** — ошибка: ${safeText(r.error, 200)}`
+        : `- ✅ **«${safeText(r.title ?? r.documentId)}»** — текст вставлен`,
     reportTitle: "Независимая проверка вставки текста",
     reportSubtitle: "запрошено ⇄ живое содержимое Google Docs",
     consentStore,
@@ -750,12 +817,16 @@ async function executeReplaceBatchCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Replaced",
+    verb: "Заменено",
     summaryIcon: "🔄",
     verify: (r) => {
       const it = payload.items.find((x) => x.documentId === r.documentId)!;
       return postVerifyReplaceApplied(g, r.documentId, it.find, it.replace, it.matchCase ?? false);
     },
+    renderItem: (r) =>
+      r.error
+        ? `- ❌ **«${safeText(r.title ?? r.documentId)}»** — ошибка: ${safeText(r.error, 200)}`
+        : `- ✅ **«${safeText(r.title ?? r.documentId)}»** — заменено совпадений: ${r.occurrencesChanged ?? 0}`,
     reportTitle: "Независимая проверка замены",
     reportSubtitle: "запрошено ⇄ живое содержимое Google Docs",
     consentStore,
@@ -808,17 +879,22 @@ async function executeRawBatchBatchCore(
 ): Promise<ReturnType<typeof ok>> {
   const results: Array<{
     documentId: string;
+    title?: string | null;
     replies?: unknown;
     error?: string;
   }> = [];
   for (const item of payload.items) {
     const { documentId, requests } = item;
     try {
+      // Live-read title'а перед мутацией — та же причина, что у insert выше:
+      // без неё строка отчёта показывала бы голый documentId (запрещено
+      // output-format.md §7.1 п.2).
+      const doc = await g.docs.documents.get({ documentId });
       const res = await g.docs.documents.batchUpdate({
         documentId,
         requestBody: { requests: requests as object[] },
       });
-      results.push({ documentId, replies: res.data.replies });
+      results.push({ documentId, title: doc.data.title ?? null, replies: res.data.replies });
     } catch (err: unknown) {
       results.push({
         documentId,
@@ -830,9 +906,13 @@ async function executeRawBatchBatchCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Applied",
+    verb: "Применено",
     summaryIcon: "⚙️",
     verify: (r) => postVerifyRawBatchApplied(g, r.documentId),
+    renderItem: (r) =>
+      r.error
+        ? `- ❌ **«${safeText(r.title ?? r.documentId)}»** — ошибка: ${safeText(r.error, 200)}`
+        : `- ✅ **«${safeText(r.title ?? r.documentId)}»** — запрос применён`,
     reportTitle: "Независимая проверка raw batchUpdate",
     reportSubtitle: "запрошено ⇄ доступность документа (содержимое не проверяется — честный предел)",
     consentStore,

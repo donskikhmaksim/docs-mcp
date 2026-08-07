@@ -157,7 +157,12 @@ console.log("\n[1] docs_append_text: full plan→confirm round trip, mutation la
 
   const execResp = await cli.callTool({ name: "docs_append_text", arguments: { manifest_id: manifestId, user_reply: "да, пиши" } });
   const execBody = text(execResp);
-  check("execute succeeds — summary shows 1/1, no error", execBody.includes('"summary": "📝 Appended 1/1"'), execBody.slice(0, 60));
+  // Баг #131: раньше этот текст был `JSON.stringify({summary, results, verification})`
+  // — сырой JSON, а не человекочитаемый отчёт (и в частности утекал напрямую
+  // в Telegram при авто-исполнении по кнопке, см. autoExecute.ts/tg_approval.ts).
+  check("execute succeeds — summary shows 1/1, no error, по-русски", execBody.includes("### 📝 Добавлено 1/1"), execBody.slice(0, 60));
+  check("НЕ сырой JSON", !execBody.trim().startsWith("{"), execBody.slice(0, 60));
+  check("НЕ содержит служебную инструкцию для модели ('[агенту:')", !execBody.includes("[агенту:"), execBody);
   check("world IS mutated", world.docs.get("D1").text.includes("new line"));
   check("post-verify report attached with ✅", execBody.includes("Независимая проверка добавления текста") && execBody.includes("✅"));
 }

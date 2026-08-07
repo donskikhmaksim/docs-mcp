@@ -203,7 +203,14 @@ export async function startHttpServer(config: Config): Promise<void> {
     // technically-correct secret, and must never depend on whoever ports this
     // file to the other 5 repos remembering to not mount the route --
     // 404 (not 401) so a non-owner server doesn't even reveal the route exists.
-    if (!tgApprovalConfig.webhookOwner) {
+    //
+    // `ownBot` (TG_BOT_TOKEN_OVERRIDE, config.ts) is the escape hatch from the
+    // shared-bot model above: a server with its OWN dedicated bot token always
+    // owns its own webhook -- there is no shared registration to race against,
+    // so `webhookOwner` is irrelevant for it. Full backward compatibility: with
+    // TG_BOT_TOKEN_OVERRIDE unset, `ownBot` is false and this condition reduces
+    // to the original `!tgApprovalConfig.webhookOwner` check, byte-for-byte.
+    if (!tgApprovalConfig.webhookOwner && !tgApprovalConfig.ownBot) {
       res.status(404).end();
       return;
     }

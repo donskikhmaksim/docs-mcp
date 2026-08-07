@@ -360,7 +360,7 @@ export function loadConsentGateConfig(): ConsentGateConfig {
 export interface TgApprovalConfig {
   /** Env TG_APPROVAL_ENABLED, default false. */
   enabled: boolean;
-  /** Env TG_BOT_TOKEN. Required when enabled. */
+  /** Env TG_BOT_TOKEN_OVERRIDE if set, else TG_BOT_TOKEN. Required when enabled. */
   botToken: string;
   /** Env TG_OWNER_CHAT_ID — the only chat id the webhook accepts callbacks from. */
   ownerChatId: string;
@@ -390,13 +390,38 @@ export interface TgApprovalConfig {
    * silently overwrite each other and approvals for whoever registered last
    * stop reaching anyone. See `registerWebhook` in tg_approval.ts, which
    * self-guards on this field (defense-in-depth beyond the call-site check).
+   * Irrelevant when `ownBot` is true (see below) — a server with its own bot
+   * always owns its own webhook, regardless of this flag.
    */
   webhookOwner: boolean;
+  /**
+   * Env TG_BOT_TOKEN_OVERRIDE, default false detection: true iff that env var
+   * is set (non-empty). Escape hatch from the shared-bot model above — when a
+   * deployer gives THIS server its own dedicated Telegram bot/token instead of
+   * the one shared across all 6 MCP servers, `ownBot` becomes true and two
+   * things change: (1) `/tg/webhook` is served by this process regardless of
+   * `webhookOwner` (own bot ⇒ own webhook, no shared-registration race to
+   * avoid — see http.ts's route gate and `registerWebhook` below); (2)
+   * `handleWebhook` consumes decisions through the server-scoped
+   * `store.consumeTgDecision(manifestId, cfg.server, …)` instead of the
+   * shared-bot `consumeTgDecisionAnyServer(...)` — with a private bot there is
+   * no cross-server ambiguity to resolve, and scoping by `server` is strictly
+   * safer (a manifest_id collision, however unlikely given it's a UUID, could
+   * otherwise let this server's webhook decide another server's manifest).
+   * FULL BACKWARD COMPATIBILITY: when TG_BOT_TOKEN_OVERRIDE is unset, `ownBot`
+   * is false and every code path below behaves byte-for-byte as before this
+   * field existed — this is an additive, opt-in flag, not a behaviour change
+   * for existing deployments. Rollback is unsetting the env var, no redeploy
+   * of logic required.
+   */
+  ownBot: boolean;
 }
 
 export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
   const enabled = process.env.TG_APPROVAL_ENABLED?.trim().toLowerCase() === "true";
-  const botToken = process.env.TG_BOT_TOKEN?.trim() || "";
+  const botTokenOverride = process.env.TG_BOT_TOKEN_OVERRIDE?.trim() || "";
+  const botToken = botTokenOverride || process.env.TG_BOT_TOKEN?.trim() || "";
+  const ownBot = !!botTokenOverride;
   const ownerChatId = process.env.TG_OWNER_CHAT_ID?.trim() || "";
   const webhookSecret = process.env.TG_APPROVAL_WEBHOOK_SECRET?.trim() || "";
   const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
@@ -419,7 +444,7 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
   // feature or serve mutations without the second factor it claims to enforce.
   if (enabled && (!botToken || !ownerChatId || !webhookSecret || !publicBaseUrl)) {
     const missing = [
-      !botToken && "TG_BOT_TOKEN",
+      !botToken && "TG_BOT_TOKEN (or TG_BOT_TOKEN_OVERRIDE)",
       !ownerChatId && "TG_OWNER_CHAT_ID",
       !webhookSecret && "TG_APPROVAL_WEBHOOK_SECRET",
       !publicBaseUrl && "PUBLIC_BASE_URL (or RAILWAY_PUBLIC_DOMAIN)",
@@ -442,6 +467,7 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
     toolsAllowlist,
     ttlMs,
     webhookOwner,
+    ownBot,
   };
 }
 

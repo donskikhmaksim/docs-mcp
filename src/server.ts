@@ -17,6 +17,7 @@ import type { ConsentStore, ConsentConfig } from "./consent.js";
 // "./consent.js" to match gmail-mcp exactly.
 import type { TgApprovalStore, TgApprovalGate } from "./tg_approval.js";
 import { createTgApprovalGate } from "./tg_approval.js";
+import { checkAutomationKey } from "./automation_key.js";
 import {
   storeReady,
   createManifest,
@@ -125,6 +126,13 @@ export function buildMcpServer(user: User): McpServer {
     consentCfg: consentServerConfig,
     auditStore: storeReady() ? auditStoreAdapter : null,
     tg: tgApprovalGate,
+    // automation_key (docs/TZ_automation_key_consent_gate.md): undefined
+    // exactly when Postgres isn't configured, same honest-degradation
+    // convention as consentStore/auditStore above — checkAutomationKey.js
+    // itself already no-ops safely without a store, but keeping the branch
+    // absent (not just returning false) matches consent.ts's documented
+    // invariant that undefined fully disables the automation_key path.
+    checkAutomationKey: storeReady() ? checkAutomationKey : undefined,
   };
   registerAccountTools(server, clients);
   registerDocsTools(server, clients, consentCtx);

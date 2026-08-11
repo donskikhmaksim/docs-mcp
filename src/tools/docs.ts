@@ -12,6 +12,7 @@ import {
   sha256,
   formatLaTime,
   USER_REPLY_DOC,
+  AUTOMATION_KEY_DOC,
   type ConsentStore,
   type ConsentConfig,
 } from "../consent.js";
@@ -89,6 +90,15 @@ export interface DocsConsentContext {
    * callers/tests that build a `DocsConsentContext` without it keep compiling.
    */
   tg?: TgApprovalGate;
+  /**
+   * automation_key check (docs/TZ_automation_key_consent_gate.md), DI same
+   * shape as `consent.ts`'s `checkAutomationKey` on `RequireConsentParams`.
+   * undefined ⇒ the automation_key branch in every `requireConsent()` call
+   * below is fully disabled (server.ts leaves this unset when Postgres isn't
+   * configured — same honest-degradation rule as `consentStore`/`auditStore`
+   * above). Optional so existing callers/tests keep compiling unchanged.
+   */
+  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit
@@ -1042,11 +1052,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, documents, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, documents, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Создание недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1064,6 +1075,8 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: () => {
           if (!documents || !documents.length) {
             throw new Error("Нужен непустой `documents`, чтобы построить план создания.");
@@ -1127,11 +1140,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Добавление текста недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -1149,6 +1163,8 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план добавления текста.");
@@ -1214,11 +1230,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Вставка текста недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1236,6 +1253,8 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план вставки текста.");
@@ -1302,11 +1321,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Замена недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1324,6 +1344,8 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план замены.");
@@ -1408,11 +1430,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Raw batchUpdate недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1430,6 +1453,8 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужны непустой `items`, чтобы построить план.");

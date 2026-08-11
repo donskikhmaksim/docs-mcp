@@ -186,6 +186,66 @@ export async function ensureSchema(): Promise<void> {
   await p.query(
     `CREATE INDEX IF NOT EXISTS tg_approvals_cleanup_idx ON tg_approvals (server, status, expires_at)`,
   );
+
+  // ---- automation_key windows (docs/TZ_automation_key_consent_gate.md,
+  // 2026-08-11). Shared table across the WHOLE ecosystem (gmail/calendar/
+  // drive/sheets/docs/ticktick) — generation happens ONLY in gmail-mcp
+  // (`gmail-mcp/src/automation_key.ts`); this server is a READER only, never
+  // INSERTs/UPDATEs a row here. `CREATE TABLE IF NOT EXISTS` is declared so a
+  // fresh dev database (docs-mcp run standalone, without gmail-mcp ever
+  // having touched it) still lets `listActiveAutomationWindows` query
+  // something sane instead of erroring on a missing table — on the shared
+  // production Postgres this is a no-op (gmail-mcp already created it).
+  // Deliberately NOT porting gmail-mcp's legacy `server`-column backfill/
+  // `ALTER ... DROP NOT NULL` migration here: that dance exists only to let a
+  // WRITER insert without the old NOT NULL `server` column in the way, and
+  // this server never writes to this table.
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS tg_automation_windows (
+      window_id       TEXT PRIMARY KEY,
+      token_hash      TEXT NOT NULL,
+      scope           TEXT,
+      label           TEXT,
+      created_at      BIGINT NOT NULL,
+      expires_at      BIGINT NOT NULL,
+      revoked_at      BIGINT,
+      created_by_chat TEXT NOT NULL
+    )
+  `);
+}
+
+/** One row of `tg_automation_windows`, as much as this READ-ONLY consumer
+ * needs (no `label`/`createdByChat` — nothing here uses them). */
+export interface AutomationWindowRow {
+  windowId: string;
+  tokenHash: string;
+  scope: string | null;
+  createdAt: number;
+}
+
+/**
+ * Active (not revoked, not expired) automation_key windows, oldest first —
+ * mirrors ticktick-mcp's `find_window` query shape: no `server`/`scope`
+ * filter in SQL (the table is shared by the whole ecosystem, not scoped to
+ * one server's rows), filtering by scope happens in `automation_key.ts`'s
+ * `checkAutomationKey`. Read-only: this server never writes to this table
+ * (generation lives only in gmail-mcp).
+ */
+export async function listActiveAutomationWindows(nowMs: number): Promise<AutomationWindowRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT window_id, token_hash, scope, created_at
+       FROM tg_automation_windows
+      WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > $1)
+      ORDER BY created_at ASC`,
+    [nowMs],
+  );
+  return res.rows.map((r) => ({
+    windowId: r.window_id as string,
+    tokenHash: r.token_hash as string,
+    scope: (r.scope as string | null) ?? null,
+    createdAt: Number(r.created_at),
+  }));
 }
 
 // ---- Google accounts (multi-account, one owner per instance) ----

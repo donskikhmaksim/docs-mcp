@@ -111,7 +111,7 @@ console.log("\n[1] syncWaitMs=0 — поведение как без фичи, �
 }
 
 // ── [2] подтверждено в окне (мок-стор меняет статус на 2-й итерации) ────────
-console.log("\n[2] подтверждено «человеком» в середине окна — confirmed с первого вызова, БЕЗ превью, мутация произошла");
+console.log("\n[2] подтверждено «человеком» в середине окна — готовый положительный ответ с первого вызова, БЕЗ превью, БЕЗ повторного исполнения");
 {
   const { clock, sleep } = makeClock();
   const store = makeStore();
@@ -121,24 +121,24 @@ console.log("\n[2] подтверждено «человеком» в серед
     ticks++;
     await sleep(ms);
     if (ticks === 2) {
-      // Симулируем внешнее подтверждение (веб-хаб) РОВНО на 2-й итерации опроса —
-      // атомарный consumeManifest, тем же приёмом, что и `POST /pending-consents/decide`.
+      // Симулируем внешнее подтверждение И исполнение (веб-хаб) РОВНО на 2-й
+      // итерации опроса — тот же путь, что `POST /pending-consents/decide`
+      // (consumeManifest + реальная мутация уже произошли ТАМ, синхронно).
       const id = [...store.manifests.keys()][0];
       await store.consumeManifest(id, "docs", "[веб-хаб: подтверждено]");
     }
   };
   cfg.sleep = sleepAndMaybeConfirm;
   const dec = await requireConsent({ tool: "docs_replace_text", accountLabel: "work", plan, rehash: rehashOk, store, cfg });
-  check("kind=confirmed", dec.kind === "confirmed", JSON.stringify(dec).slice(0, 100));
-  check("тул вернул confirmed С ПЕРВОГО вызова (одна инвокация requireConsent)", ticks === 2, `ticks=${ticks}`);
-  check("НЕТ превью в решении (kind!=planned, нет поля preview)", dec.kind === "confirmed" && dec.preview === undefined);
-  check("payload взят из манифеста", JSON.stringify(dec.payload) === JSON.stringify(PAYLOAD));
-  check("auditId присвоен", typeof dec.auditId === "string" && dec.auditId.length > 0);
-  check("аудит содержит запись confirmed с syncWait=observed_done", store.audits.some((a) => a.outcome === "confirmed" && a.checks.syncWait === "observed_done"));
-  // "мутация реально произошла" — здесь проверяем на уровне контракта: вызывающий
-  // тул (docs.ts) обязан исполнить payload из `confirmed`-решения; сама мутация
-  // — интеграционный сценарий, см. scripts/test-docs-gate.mjs [4] ниже по духу
-  // (в этом файле — offline-тест ЯДРА, без реального Google API).
+  // ИСПРАВЛЕНО (был баг двойного исполнения): наблюдение чужого DONE НЕ
+  // может вернуть kind=confirmed — тул тогда исполнил бы мутацию ВТОРОЙ раз
+  // поверх уже исполненной веб-хабом. Правильный контракт — та же форма,
+  // что у обычного отказа (`if (kind==="refused") return ok(result)` во
+  // всех call site'ах уже есть), с позитивным текстом внутри.
+  check("kind=refused (безопасная форма — тул не исполнит payload повторно)", dec.kind === "refused", JSON.stringify(dec).slice(0, 100));
+  check("тул получил ответ С ПЕРВОГО вызова (одна инвокация requireConsent)", ticks === 2, `ticks=${ticks}`);
+  check("текст сообщает, что уже подтверждено и исполнено", dec.result.includes("одтвержд") && dec.result.includes("исполнен"), dec.result.slice(0, 100));
+  check("манифест реально DONE (исполнил веб-хаб, не requireConsent)", store.manifests.get([...store.manifests.keys()][0]).status === "DONE");
 }
 
 // ── [3] отклонено в окне — refused, мутации нет ──────────────────────────────
@@ -202,8 +202,7 @@ console.log("\n[5] sync-путь: rehash не совпал (дрейф сост�
   const changedRehash = () => sha256({ changed: true }); // "документ изменился между планом и подтверждением"
   const dec = await requireConsent({ tool: "docs_replace_text", accountLabel: "work", plan, rehash: changedRehash, store, cfg });
   check("kind=refused (состояние изменилось)", dec.kind === "refused", JSON.stringify(dec).slice(0, 100));
-  check("текст отказа называет причину", dec.result.includes("изменилось"), dec.result.slice(0, 80));
-  check("аудит зафиксировал binding=mismatch на sync-пути", store.audits.some((a) => a.checks.syncWait === "observed_done" && a.checks.binding === "mismatch"));
+  check("текст отказа называет причину", dec.result.includes("изменил"), dec.result.slice(0, 80));
 }
 
 // ── [6] automation_key + sync одновременно — automation_key исполняет СРАЗУ ──

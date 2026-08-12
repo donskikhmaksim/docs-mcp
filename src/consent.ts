@@ -728,59 +728,29 @@ export async function requireConsent<T = unknown>(
         // полосы (веб-хаб /pending-consents/decide — тот же атомарный
         // consumeManifest, что и у авто-исполнения по кнопке в Telegram).
         //
-        // ЧЕСТНЫЙ ОСТАТОЧНЫЙ ПРЕДЕЛ (тот же принцип, что у user_reply в шапке
-        // файла — назвать компромисс, а не спрятать): consumeManifest сам по
-        // себе НЕ выполняет мутацию — он только помечает манифест DONE;
-        // реальный вызов Google API делает ВЫЗЫВАЮЩИЙ этот декоративный
-        // `confirmed`-результат тул (как и на обычном execute-пути). Если
-        // ИМЕННО в это же ~1с окно кто-то ВНЕШНИЙ (веб-хаб) уже успел не
-        // только consume, но и исполнить мутацию сам (см. http.ts's
-        // `/pending-consents/decide`, которая тоже это делает — синхронно,
-        // чтобы сразу отдать результат браузеру), инструмент выполнит её
-        // ЕЩЁ РАЗ по возврату отсюда. Окно гонки — доли секунды между тем,
-        // как веб-хаб атомарно консьюмит манифест, и следующим тиком этого
-        // опроса; названо, не скрыто — как и любой другой честный предел
-        // этого файла.
+        // ИСПРАВЛЕНО (было: возврат {kind:"confirmed"}, что вело к
+        // ПОВТОРНОМУ исполнению мутации вызывающим тулом — веб-хаб уже
+        // исполнил её синхронно внутри своего HTTP-запроса, ДО того, как
+        // consumeManifest вообще стал виден этому опросу). ЭТА ветка теперь
+        // ТОЛЬКО ЧИТАЕТ и НИКОГДА не даёт вызывающему тулу сигнал исполнять
+        // ещё раз — положительный исход оборачивается в ту же ФОРМУ, что и
+        // обычный отказ ({kind:"refused"}): у ВСЕХ call site'ов уже есть `if
+        // (kind==="refused") return ok(result)`, то есть тул просто
+        // ретранслирует текст модели БЕЗ повторного исполнения payload.
+        // Аудит-запись за это исполнение уже написал ТОТ, кто реально
+        // исполнил (веб-хаб через tryAutoExecute) — здесь новую не пишем,
+        // чтобы не задваивать аудит-лог.
         const currentHash = await rehash(row.payload as ConsentAddressing);
-        const auditId = randomUUID();
-        if (currentHash !== row.objectHash) {
-          await store.appendConsentAudit({
-            id: auditId,
-            ts: now(),
-            server: cfg.server,
-            tool,
-            accountLabel,
-            manifestId: id,
-            objectHash: row.objectHash,
-            userReply: row.userReply ?? "",
-            checks: { syncWait: "observed_done", binding: "mismatch" },
-            outcome: "refused",
-            refusalReason: "sync_wait_binding_mismatch",
-            actor: "human",
-          });
-          return {
-            kind: "refused",
-            result: renderRefusal(
-              "Состояние изменилось после планирования",
-              "Объекты, к которым относился план, изменились между планированием и подтверждением. " +
-                "Ради безопасности исполнение отклонено — построй план заново.",
-            ),
-          };
-        }
-        await store.appendConsentAudit({
-          id: auditId,
-          ts: now(),
-          server: cfg.server,
-          tool,
-          accountLabel,
-          manifestId: id,
-          objectHash: row.objectHash,
-          userReply: row.userReply ?? "",
-          checks: { syncWait: "observed_done", binding: "ok" },
-          outcome: "confirmed",
-          actor: "human",
-        });
-        return { kind: "confirmed", manifestId: id, payload: row.payload as T, auditId };
+        const bindingOk = currentHash === row.objectHash;
+        const header = bindingOk ? "✅ Подтверждено и исполнено" : "⚠️ Подтверждено, но состояние изменилось";
+        const body = bindingOk
+          ? `${previewBody}\n\nРешение по этому плану уже принято и исполнено через другой канал ` +
+            "(например, веб-подтверждение), пока шло ожидание ответа. Повторно вызывать этот инструмент " +
+            "с этим планом не нужно."
+          : `${previewBody}\n\nДействие было подтверждено и исполнено через другой канал, но состояние ` +
+            "окружения с момента построения плана уже успело измениться — фактический результат мог не " +
+            "совпасть с тем, что показано в плане выше. Проверьте результат отдельно.";
+        return { kind: "refused", result: renderConsentBlock(header, body) };
       }
       // Дедлайн истёк, манифест всё ещё AWAITING_CONSENT — не ошибка, ничего
       // не потеряно: падаем на обычное превью ниже, как и раньше.

@@ -212,11 +212,15 @@ console.log("\n[3] docs_replace_text: user says 'нет' → 🛑 отменен
 }
 
 // ── [4] гибридное короткое ожидание (docs/TZ_consent_web_hub.md, часть 1) ───
-// End-to-end доказательство пункта 2 тестового плана ("мутация реально
-// произошла") — не в изоляции ядра (см. scripts/test-consent-sync-wait.mjs),
-// а через РЕАЛЬНЫЙ tool-wrapper (docs.ts), который получает `confirmed` от
-// `requireConsent` и вызывает `executeAppendBatchCore` сам.
-console.log("\n[4] docs_append_text: confirmed «извне» в середине окна ожидания → ОДИН вызов тула, мутация реально произошла");
+// End-to-end доказательство пункта 2 тестового плана — но по ИСПРАВЛЕННОМУ
+// (безопасному) контракту: реальную мутацию исполняет тот канал, который
+// РЕАЛЬНО подтвердил (веб-хаб, через tryAutoExecute — здесь симулируется
+// напрямую мутацией world), а requireConsent, наблюдая чужой DONE, НИКОГДА
+// не говорит вызывающему тулу «исполняй» — иначе мутация случилась бы
+// ДВАЖДЫ. Раньше здесь стоял противоположный (небезопасный) тест-контракт —
+// заменено намеренно, см. `src/consent.ts`, комментарий "ИСПРАВЛЕНО" рядом
+// с обработкой row.status === "DONE".
+console.log("\n[4] docs_append_text: подтверждено и исполнено «извне» в середине окна ожидания → ОДИН вызов тула, мутация НЕ дублируется");
 {
   const world = makeDocWorld();
   let ticks = 0;
@@ -227,9 +231,14 @@ console.log("\n[4] docs_append_text: confirmed «извне» в середин�
       ticks++;
       await new Promise((r) => setTimeout(r, 0)); // не ждём реальные 10с в тесте
       if (ticks === 2) {
-        // Симулируем POST /pending-consents/decide, случившийся ПОКА
-        // этот же вызов docs_append_text ещё ждёт (веб-хаб подтвердил
-        // атомарным consumeManifest, ровно как http.ts's decide-роут).
+        // Симулируем POST /pending-consents/decide, случившийся ПОКА этот же
+        // вызов docs_append_text ещё ждёт. В реальности decide-роут САМ
+        // выполняет мутацию через tryAutoExecute (не просто помечает
+        // манифест DONE) — здесь это симулируется прямой мутацией world,
+        // ТЕМ ЖЕ способом, каким реальный batchUpdate дописывает текст.
+        const d = world.docs.get("D1");
+        d.text = d.text + "confirmed via hub";
+        bumpRev(d);
         const id = [...manifestsRef.keys()][0];
         await consentStoreRef.consumeManifest(id, "docs", "[веб-хаб: подтверждено]");
       }
@@ -244,9 +253,10 @@ console.log("\n[4] docs_append_text: confirmed «извне» в середин�
 
   const planResp = await cli.callTool({ name: "docs_append_text", arguments: { items: [{ documentId: "D1", text: "confirmed via hub" }] } });
   const planBody = text(planResp);
-  check("тул вернул confirmed (не planned/превью) с первого вызова", planBody.includes("### 📝 Добавлено"), planBody.slice(0, 80));
-  check("превью НЕ показывалось (нет текста «план `…`»)", !planBody.includes("_план `"));
-  check("world IS mutated — мутация реально произошла", world.docs.get("D1").text.includes("confirmed via hub"));
+  check("тул НЕ вернул собственный отчёт об исполнении (не «### 📝 Добавлено»)", !planBody.includes("### 📝 Добавлено"), planBody.slice(0, 80));
+  check("текст сообщает, что уже подтверждено и исполнено через другой канал", planBody.includes("одтвержд") && planBody.includes("исполнен"), planBody.slice(0, 150));
+  const occurrences = (world.docs.get("D1").text.match(/confirmed via hub/g) || []).length;
+  check("мутация произошла РОВНО ОДИН раз (не задвоена вызывающим тулом)", occurrences === 1, `occurrences=${occurrences}`);
   check("ровно 2 итерации опроса (подтверждено на 2-й)", ticks === 2, `ticks=${ticks}`);
 }
 

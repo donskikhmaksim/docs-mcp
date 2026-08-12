@@ -696,6 +696,52 @@ export async function invalidateManifest(id: string, server: string, userReply: 
   );
 }
 
+/**
+ * Atomic reject — same shape as `consumeManifest` above (single `UPDATE …
+ * WHERE … RETURNING`), but marks INVALIDATED instead of DONE. Used by the
+ * consent web-hub's `POST /pending-consents/decide` (docs/TZ_consent_web_hub.md,
+ * part 2) so a double "reject" click on the same manifest is a structural
+ * no-op (returns null) rather than a JS-level race — mirrors `consumeManifest`'s
+ * own reasoning for why it's an atomic UPDATE and not a read-then-write.
+ * `invalidateManifest` above stays untouched (still used by consent.ts's
+ * negation path, which doesn't need the RETURNING row).
+ */
+export async function rejectManifest(
+  id: string,
+  server: string,
+  userReply: string,
+): Promise<ConsentManifestRow | null> {
+  const p = getPool();
+  const now = Date.now();
+  const res = await p.query(
+    `UPDATE consent_manifests SET status = 'INVALIDATED', user_reply = $3
+      WHERE id = $1 AND server = $2 AND status = 'AWAITING_CONSENT' AND expires_at > $4
+      RETURNING *`,
+    [id, server, userReply, now],
+  );
+  if (!res.rows.length) return null;
+  return rowToManifest(res.rows[0]);
+}
+
+/**
+ * Pending (AWAITING_CONSENT, not expired) manifests for `server` — read path
+ * for the consent web-hub's `GET /pending-consents` (docs/TZ_consent_web_hub.md,
+ * part 2). Oldest first, same ordering convention as `listApprovedUnexecuted`.
+ */
+export async function listPendingConsents(
+  server: string,
+  nowMs: number,
+  limit = 50,
+): Promise<ConsentManifestRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT * FROM consent_manifests WHERE server = $1 AND status = 'AWAITING_CONSENT' AND expires_at > $2
+      ORDER BY created_at ASC LIMIT $3`,
+    [server, nowMs, limit],
+  );
+  return res.rows.map(rowToManifest);
+}
+
 /** Append-only: one row per gate decision (confirmed/refused/invalidated). */
 export async function appendConsentAudit(entry: ConsentAuditEntry): Promise<void> {
   const p = getPool();

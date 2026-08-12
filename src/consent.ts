@@ -194,6 +194,33 @@ export interface ConsentConfig {
   sendBatchMax: number;
   /** Инъекция часов (для тестов). Дефолт Date.now. */
   now?: () => number;
+  /**
+   * Гибридное короткое ожидание (docs/TZ_consent_web_hub.md, часть 1): сколько
+   * мс `requireConsent` ждёт ПОСЛЕ построения плана, ДО возврата превью,
+   * опрашивая собственный стор — вдруг манифест уже подтверждён/отклонён
+   * (веб-хаб/кнопка/ещё один вызов) прямо сейчас, и модель получит готовый
+   * результат ОДНИМ вызовом вместо второго прохода. Env CONSENT_SYNC_WAIT_MS,
+   * дефолт 25000 (25с — с запасом под типовой ~60с таймаут MCP-клиента).
+   * `0`/undefined ⇒ ветка целиком выключена, побайтовая совместимость с
+   * поведением до этой правки — ни одного лишнего запроса к стору, ни одной
+   * задержки.
+   */
+  syncWaitMs?: number;
+  /** Интервал опроса стора внутри `syncWaitMs`-окна, мс. Env
+   * CONSENT_SYNC_POLL_MS, дефолт 1000. Не используется, когда `syncWaitMs`
+   * выключен. */
+  syncPollMs?: number;
+  /**
+   * Инъекция ожидания (для тестов — управляемые "часы" без реального
+   * `setTimeout`), тем же приёмом, что и `now` выше. Дефолт — настоящий
+   * `setTimeout`. Тестовый `sleep` обычно одновременно двигает и `now()`,
+   * чтобы цикл опроса завершался мгновенно, а не по 25 реальных секунд.
+   */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -669,6 +696,94 @@ export async function requireConsent<T = unknown>(
       previewBody =
         `${built.preview}\n\n_⏳ Запрос на подтверждение отправлен в Telegram — подтвердите кнопкой в ` +
         `боте, затем ответьте «да» здесь._`;
+    }
+
+    // ───── Гибридное короткое ожидание (docs/TZ_consent_web_hub.md, часть 1) ─────
+    // `syncWaitMs` не задан/0 ⇒ ветка целиком не существует — ни одного
+    // лишнего обращения к стору, ни одной задержки, побайтовая совместимость.
+    if (cfg.syncWaitMs && cfg.syncWaitMs > 0) {
+      const sleep = cfg.sleep ?? defaultSleep;
+      const pollMs = cfg.syncPollMs && cfg.syncPollMs > 0 ? cfg.syncPollMs : 1000;
+      const deadline = now() + cfg.syncWaitMs;
+      while (now() < deadline) {
+        await sleep(pollMs);
+        // ТОЛЬКО чтение собственного стора — никаких новых внешних
+        // вызовов/HTTP из этого модуля (дисциплина ТЗ, часть 1).
+        const row = await store.getManifest(id, cfg.server);
+        if (!row || row.status === "AWAITING_CONSENT") continue; // ещё не решено — ждём дальше
+
+        if (row.status === "INVALIDATED") {
+          // Отклонено вне полосы (веб-хаб/кнопка) в течение окна — тот же
+          // текст отказа, что и на обычном пути негации.
+          return refuse(
+            "Отменено пользователем",
+            "Пользователь отклонил план (веб-хаб/Telegram) во время ожидания. План отменён, " +
+              "ничего не выполнено. Чтобы повторить — построй план заново.",
+            { syncWait: "invalidated" },
+            { manifestId: id, objectHash: row.objectHash, outcome: "invalidated", reason: "sync_wait_invalidated" },
+          );
+        }
+
+        // row.status === "DONE" — манифест уже подтверждён и consumed вне
+        // полосы (веб-хаб /pending-consents/decide — тот же атомарный
+        // consumeManifest, что и у авто-исполнения по кнопке в Telegram).
+        //
+        // ЧЕСТНЫЙ ОСТАТОЧНЫЙ ПРЕДЕЛ (тот же принцип, что у user_reply в шапке
+        // файла — назвать компромисс, а не спрятать): consumeManifest сам по
+        // себе НЕ выполняет мутацию — он только помечает манифест DONE;
+        // реальный вызов Google API делает ВЫЗЫВАЮЩИЙ этот декоративный
+        // `confirmed`-результат тул (как и на обычном execute-пути). Если
+        // ИМЕННО в это же ~1с окно кто-то ВНЕШНИЙ (веб-хаб) уже успел не
+        // только consume, но и исполнить мутацию сам (см. http.ts's
+        // `/pending-consents/decide`, которая тоже это делает — синхронно,
+        // чтобы сразу отдать результат браузеру), инструмент выполнит её
+        // ЕЩЁ РАЗ по возврату отсюда. Окно гонки — доли секунды между тем,
+        // как веб-хаб атомарно консьюмит манифест, и следующим тиком этого
+        // опроса; названо, не скрыто — как и любой другой честный предел
+        // этого файла.
+        const currentHash = await rehash(row.payload as ConsentAddressing);
+        const auditId = randomUUID();
+        if (currentHash !== row.objectHash) {
+          await store.appendConsentAudit({
+            id: auditId,
+            ts: now(),
+            server: cfg.server,
+            tool,
+            accountLabel,
+            manifestId: id,
+            objectHash: row.objectHash,
+            userReply: row.userReply ?? "",
+            checks: { syncWait: "observed_done", binding: "mismatch" },
+            outcome: "refused",
+            refusalReason: "sync_wait_binding_mismatch",
+            actor: "human",
+          });
+          return {
+            kind: "refused",
+            result: renderRefusal(
+              "Состояние изменилось после планирования",
+              "Объекты, к которым относился план, изменились между планированием и подтверждением. " +
+                "Ради безопасности исполнение отклонено — построй план заново.",
+            ),
+          };
+        }
+        await store.appendConsentAudit({
+          id: auditId,
+          ts: now(),
+          server: cfg.server,
+          tool,
+          accountLabel,
+          manifestId: id,
+          objectHash: row.objectHash,
+          userReply: row.userReply ?? "",
+          checks: { syncWait: "observed_done", binding: "ok" },
+          outcome: "confirmed",
+          actor: "human",
+        });
+        return { kind: "confirmed", manifestId: id, payload: row.payload as T, auditId };
+      }
+      // Дедлайн истёк, манифест всё ещё AWAITING_CONSENT — не ошибка, ничего
+      // не потеряно: падаем на обычное превью ниже, как и раньше.
     }
 
     return { kind: "planned", manifestId: id, preview: renderPlanned(previewBody, id, expiresAt) };

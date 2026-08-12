@@ -68,6 +68,8 @@ export const consentServerConfig: ConsentConfig = {
   consentTtlMs: consentGateEnv.consentTtlMs,
   minConsentGapMs: consentGateEnv.minConsentGapMs,
   sendBatchMax: consentGateEnv.sendBatchMax,
+  syncWaitMs: consentGateEnv.syncWaitMs,
+  syncPollMs: consentGateEnv.syncPollMs,
 };
 
 /**

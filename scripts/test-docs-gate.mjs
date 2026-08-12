@@ -93,7 +93,7 @@ function buildClients(world) {
   };
 }
 
-async function harness(world) {
+async function harness(world, cfgOverrides = {}) {
   const clients = buildClients(world);
   const manifests = new Map();
   const audits = [];
@@ -128,14 +128,18 @@ async function harness(world) {
       if (a) Object.assign(a, outcome);
     },
   };
-  const consentCtx = { consentStore, consentCfg: { server: "docs", consentTtlMs: 3_600_000, minConsentGapMs: 0, sendBatchMax: 10 }, auditStore: null };
+  const consentCtx = {
+    consentStore,
+    consentCfg: { server: "docs", consentTtlMs: 3_600_000, minConsentGapMs: 0, sendBatchMax: 10, ...cfgOverrides },
+    auditStore: null,
+  };
   const server = new McpServer({ name: "docs-gate-e2e", version: "0" });
   registerAccountTools(server, clients);
   registerDocsTools(server, clients, consentCtx);
   const cli = new Client({ name: "c", version: "0" });
   const [a, b] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(b), cli.connect(a)]);
-  return { cli, manifests, world };
+  return { cli, manifests, world, consentStore };
 }
 
 function extractManifestId(planText) {
@@ -205,6 +209,45 @@ console.log("\n[3] docs_replace_text: user says 'нет' → 🛑 отменен
   const retryResp = await cli.callTool({ name: "docs_replace_text", arguments: { manifest_id: manifestId, user_reply: "да" } });
   check("re-using an invalidated manifest still fails", text(retryResp).includes("🛑"), text(retryResp).slice(0, 60));
   check("data STILL untouched", world.docs.get("D1").text.includes("precious data here"));
+}
+
+// ── [4] гибридное короткое ожидание (docs/TZ_consent_web_hub.md, часть 1) ───
+// End-to-end доказательство пункта 2 тестового плана ("мутация реально
+// произошла") — не в изоляции ядра (см. scripts/test-consent-sync-wait.mjs),
+// а через РЕАЛЬНЫЙ tool-wrapper (docs.ts), который получает `confirmed` от
+// `requireConsent` и вызывает `executeAppendBatchCore` сам.
+console.log("\n[4] docs_append_text: confirmed «извне» в середине окна ожидания → ОДИН вызов тула, мутация реально произошла");
+{
+  const world = makeDocWorld();
+  let ticks = 0;
+  const cfgOverrides = {
+    syncWaitMs: 10_000,
+    syncPollMs: 1_000,
+    sleep: async (ms) => {
+      ticks++;
+      await new Promise((r) => setTimeout(r, 0)); // не ждём реальные 10с в тесте
+      if (ticks === 2) {
+        // Симулируем POST /pending-consents/decide, случившийся ПОКА
+        // этот же вызов docs_append_text ещё ждёт (веб-хаб подтвердил
+        // атомарным consumeManifest, ровно как http.ts's decide-роут).
+        const id = [...manifestsRef.keys()][0];
+        await consentStoreRef.consumeManifest(id, "docs", "[веб-хаб: подтверждено]");
+      }
+    },
+  };
+  // manifestsRef/consentStoreRef заполняются ниже, после harness() — сам
+  // cfgOverrides.sleep читает их через замыкание (ссылки, не значения).
+  let manifestsRef, consentStoreRef;
+  const { cli, manifests, consentStore } = await harness(world, cfgOverrides);
+  manifestsRef = manifests;
+  consentStoreRef = consentStore;
+
+  const planResp = await cli.callTool({ name: "docs_append_text", arguments: { items: [{ documentId: "D1", text: "confirmed via hub" }] } });
+  const planBody = text(planResp);
+  check("тул вернул confirmed (не planned/превью) с первого вызова", planBody.includes("### 📝 Добавлено"), planBody.slice(0, 80));
+  check("превью НЕ показывалось (нет текста «план `…`»)", !planBody.includes("_план `"));
+  check("world IS mutated — мутация реально произошла", world.docs.get("D1").text.includes("confirmed via hub"));
+  check("ровно 2 итерации опроса (подтверждено на 2-й)", ticks === 2, `ticks=${ticks}`);
 }
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);

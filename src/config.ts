@@ -335,11 +335,30 @@ export interface ConsentGateConfig {
    * (plan §0.2/[R:полнота-7]); over the cap, the tool refuses with "split it
    * up" instead of creating a manifest. Env SEND_BATCH_MAX, default 10. */
   sendBatchMax: number;
+  /** Гибридное короткое ожидание (docs/TZ_consent_web_hub.md, часть 1). Env
+   * CONSENT_SYNC_WAIT_MS, default 25000 (25с). `0` явно выключает ветку
+   * целиком — в отличие от `positiveIntEnv`-полей выше, 0 здесь ЗНАЧИМОЕ
+   * валидное значение, а не «не задано», поэтому читается отдельным
+   * `nonNegativeIntEnv` ниже. */
+  syncWaitMs: number;
+  /** Интервал опроса внутри `syncWaitMs`-окна. Env CONSENT_SYNC_POLL_MS,
+   * default 1000. */
+  syncPollMs: number;
 }
 
 function positiveIntEnv(name: string, fallback: number): number {
   const raw = Number(process.env[name]);
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+/** Same as `positiveIntEnv`, but `0` is a valid, meaningful value (not
+ * "unset" -> fallback) — used for CONSENT_SYNC_WAIT_MS, where 0 explicitly
+ * disables the sync-wait branch (docs/TZ_consent_web_hub.md, part 1). */
+function nonNegativeIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
 export function loadConsentGateConfig(): ConsentGateConfig {
@@ -348,7 +367,20 @@ export function loadConsentGateConfig(): ConsentGateConfig {
     consentTtlMs: positiveIntEnv("CONSENT_TTL_MS", 3_600_000),
     minConsentGapMs: positiveIntEnv("MIN_CONSENT_GAP_MS", 2_000),
     sendBatchMax: positiveIntEnv("SEND_BATCH_MAX", 10),
+    syncWaitMs: nonNegativeIntEnv("CONSENT_SYNC_WAIT_MS", 25_000),
+    syncPollMs: positiveIntEnv("CONSENT_SYNC_POLL_MS", 1_000),
   };
+}
+
+/**
+ * Web-хаб подтверждений (docs/TZ_consent_web_hub.md, часть 2). Общий секрет
+ * на всю экосистему (как AUTOMATION_KEY), заголовок `X-Consent-Hub-Secret`,
+ * сравнение константное по времени. undefined ⇒ `/pending-consents` и
+ * `/pending-consents/decide` отвечают 404 на обоих роутах (fail-closed, НЕ
+ * открытый доступ) — см. http.ts.
+ */
+export function loadConsentHubSecret(): string | undefined {
+  return process.env.CONSENT_HUB_SECRET?.trim() || undefined;
 }
 
 /**

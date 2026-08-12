@@ -6,7 +6,7 @@
  * This module never writes a row — it only answers "does the presented key
  * open automation_key-gated execution for docs-mcp right now".
  *
- * DI contract consumed by `consent.ts`'s `checkAutomationKey?: (key) =>
+ * DI contract consumed by `consent.ts`'s `checkAutomationKey?: (key, tool) =>
  * Promise<{ ok, channel? }>` on `RequireConsentParams`. Wired into every
  * gated tool's `requireConsent()` call from `server.ts`, the same way
  * `consentStoreAdapter`/`tgApprovalGate` are wired there.
@@ -17,6 +17,12 @@
  * ALL active rows across the whole shared table, filter by scope in
  * application code" shape (the table isn't filtered by any `server` column
  * in SQL — it's genuinely multi-service).
+ *
+ * `scopeCovers` (`docs/TZ_automation_key_method_catalog.md`) extends the old
+ * whole-service-only comparison to also accept `<service>:<tool>` tokens, so
+ * a `tg_automation_windows` row can grant a single method (e.g. `docs:
+ * docs_create`) instead of the entire service — without any DB migration:
+ * old bare-service rows keep covering every method exactly as before.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import { storeReady, listActiveAutomationWindows } from "./store.js";
@@ -24,8 +30,10 @@ import { storeReady, listActiveAutomationWindows } from "./store.js";
 /** This server's canonical name in `tg_automation_windows.scope`
  * (`docs/TZ_automation_key_hub.md`'s canonical list: gmail/calendar/drive/
  * sheets/docs/ticktick). NOT a tool argument — same $self convention as
- * `ConsentConfig.server`. */
-const SELF_SERVICE = "docs";
+ * `ConsentConfig.server`. Exported so `gated_tools_catalog.ts` and `http.ts`
+ * can stamp the same canonical name onto the `/automation-key-catalog`
+ * response without duplicating the literal string. */
+export const AUTOMATION_SERVICE = "docs";
 
 function sha256Hex(raw: string): string {
   return createHash("sha256").update(raw, "utf8").digest("hex");
@@ -44,20 +52,36 @@ function digestMatches(a: string, b: string): boolean {
   return timingSafeEqual(bufA, bufB);
 }
 
-/** `scope` covers "docs" iff it's literally "all", or "docs" is one of its
- * comma-separated tokens — exact token match, NOT a substring ("docsx" must
- * NOT match "docs"). Empty/NULL scope (a pre-migration row that never got
- * backfilled) is treated as NOT covering — fail-closed: a silent false
- * match is worse than an honest refusal here. */
-function scopeCoversMe(scope: string | null): boolean {
+/**
+ * `scope` covers `<service>` (whole-service, old behaviour) iff it's
+ * literally "all", or `service` is one of its comma-separated tokens.
+ * `scope` covers a SPECIFIC method (`docs/TZ_automation_key_method_catalog.md`)
+ * iff one of its tokens is exactly `${service}:${tool}`.
+ *
+ * Exact token match (`===`) throughout — NOT a substring/`startsWith`: a
+ * bare-service token must not match a method of a differently-prefixed
+ * service ("google-sheets" must not match "sheets"), and a method token must
+ * not match another method that merely shares a prefix
+ * ("docs:docs_create" must not match "docs:docs_create_extra").
+ *
+ * Empty/NULL scope (a pre-migration row that never got backfilled) is
+ * treated as NOT covering — fail-closed: a silent false match is worse than
+ * an honest refusal here.
+ *
+ * Backward compatibility: an already-issued bare-service token
+ * (`scope="docs"` or `scope="docs,gmail"`) keeps covering EVERY method of
+ * that service, exactly as before this function gained the `tool` parameter
+ * — no DB migration needed, this is purely a comparison-logic change.
+ */
+export function scopeCovers(scope: string | null, service: string, tool: string): boolean {
   if (!scope) return false;
   const s = scope.trim();
   if (s === "all") return true;
-  return s
+  const tokens = s
     .split(",")
     .map((part) => part.trim())
-    .filter(Boolean)
-    .includes(SELF_SERVICE);
+    .filter(Boolean);
+  return tokens.some((t) => t === service || t === `${service}:${tool}`);
 }
 
 export interface AutomationKeyCheck {
@@ -71,12 +95,14 @@ export interface AutomationKeyCheck {
 
 /**
  * Checks `provided` against every currently-active `tg_automation_windows`
- * row whose scope covers "docs". No static `AUTOMATION_KEY` channel here —
- * docs-mcp doesn't define one today (see `config.ts`; only gmail-mcp does at
- * the time of writing, `docs/TZ_automation_key_consent_gate.md` §"Что менять
- * — сервер" п.1 — "если нет, просто не будет канала static"). If one is
- * added later, wire it in here the same way ticktick-mcp's `matches_static`
- * does, checked BEFORE the window loop (cheap, no DB round trip).
+ * row whose scope covers "docs" — either the whole service or specifically
+ * `tool` (`docs/TZ_automation_key_method_catalog.md`). No static
+ * `AUTOMATION_KEY` channel here — docs-mcp doesn't define one today (see
+ * `config.ts`; only gmail-mcp does at the time of writing,
+ * `docs/TZ_automation_key_consent_gate.md` §"Что менять — сервер" п.1 —
+ * "если нет, просто не будет канала static"). If one is added later, wire it
+ * in here the same way ticktick-mcp's `matches_static` does, checked BEFORE
+ * the window loop (cheap, no DB round trip).
  *
  * Never throws: an unconfigured store (`storeReady()` false) or an empty
  * `provided` both resolve to `{ ok: false }`, same fail-closed/silent
@@ -84,12 +110,12 @@ export interface AutomationKeyCheck {
  * (`consent.ts`'s automation_key branch) is documented to treat `ok: false`
  * as a silent fallthrough, never a visible error.
  */
-export async function checkAutomationKey(provided: string): Promise<AutomationKeyCheck> {
+export async function checkAutomationKey(provided: string, tool: string): Promise<AutomationKeyCheck> {
   if (!provided || !storeReady()) return { ok: false };
   const providedHash = sha256Hex(provided);
   const windows = await listActiveAutomationWindows(Date.now());
   for (const w of windows) {
-    if (!scopeCoversMe(w.scope)) continue;
+    if (!scopeCovers(w.scope, AUTOMATION_SERVICE, tool)) continue;
     if (digestMatches(w.tokenHash, providedHash)) {
       return { ok: true, channel: `window:${w.createdAt}` };
     }

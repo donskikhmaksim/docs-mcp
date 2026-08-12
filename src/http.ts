@@ -20,6 +20,8 @@ import { buildUserClients } from "./accounts.js";
 import { handleWebhook, registerWebhook, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
 import { tryAutoExecute } from "./consent.js";
 import { getAutoExecutor, type AutoExecutorCtx } from "./autoExecute.js";
+import { listGatedTools } from "./gated_tools_catalog.js";
+import { AUTOMATION_SERVICE } from "./automation_key.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -180,6 +182,21 @@ export async function startHttpServer(config: Config): Promise<void> {
     res.json({ status: "ok", endpoint: "/mcp" });
   });
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+  // ---- automation_key method catalog (docs/TZ_automation_key_method_catalog.md) ----
+  // No auth: the LIST of gated method NAMES isn't sensitive data (same
+  // principle as `tools/list` itself, which is reachable by anyone who
+  // completes MCP auth anyway — here there isn't even that gate, because
+  // tool names carry nothing secret). Consumed by gmail-mcp's hub mini-app
+  // to render a per-method checkbox tree instead of only per-service.
+  app.get("/automation-key-catalog", async (_req: Request, res: Response) => {
+    try {
+      const tools = await listGatedTools();
+      res.json({ service: AUTOMATION_SERVICE, tools });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
 
   // ---- Optional Telegram-approval webhook (plan-tg-approval.md) ----
   // Deliberately OUTSIDE the normal /mcp auth -- Telegram itself calls this,

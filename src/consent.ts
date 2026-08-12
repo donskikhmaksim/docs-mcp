@@ -271,8 +271,15 @@ export interface RequireConsentParams<T = unknown> {
    * undefined ⇒ automation_key-ветка целиком выключена — побайтовое
    * поведение как до этой правки, даже если `automationKey` зачем-то
    * передан (сервер физически не может её обработать без этой функции).
+   *
+   * Второй аргумент `tool` — имя ТЕКУЩЕГО инструмента (см. `tool` в
+   * `RequireConsentParams` выше), позволяет реализации сузить проверку до
+   * `scope="<service>:<tool>"` (`docs/TZ_automation_key_method_catalog.md`),
+   * а не только до целого сервиса. Этот модуль сам передаёт его — вызывающие
+   * инструменты (`src/tools/*.ts`) НЕ меняются, они лишь пробрасывают ссылку
+   * на функцию.
    */
-  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
+  checkAutomationKey?: (key: string, tool: string) => Promise<{ ok: boolean; channel?: string }>;
 }
 
 /** Размеченный union исхода. Отказы — здесь, НЕ через throw. */
@@ -558,7 +565,7 @@ export async function requireConsent<T = unknown>(
   // (undefined) ⇒ эта ветка целиком не существует, остальной код ниже
   // побайтово как до этой правки.
   if (p.automationKey && p.checkAutomationKey) {
-    const ak = await p.checkAutomationKey(p.automationKey);
+    const ak = await p.checkAutomationKey(p.automationKey, tool);
     if (ak.ok) {
       const akChannel = ak.channel ?? "unknown";
       const built = await plan();

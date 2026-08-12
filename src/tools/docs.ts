@@ -97,8 +97,12 @@ export interface DocsConsentContext {
    * below is fully disabled (server.ts leaves this unset when Postgres isn't
    * configured — same honest-degradation rule as `consentStore`/`auditStore`
    * above). Optional so existing callers/tests keep compiling unchanged.
+   * Second arg `tool` (docs/TZ_automation_key_method_catalog.md) lets the
+   * implementation scope the check to a single gated method instead of the
+   * whole service; call sites below pass this straight through as a function
+   * reference, they never call it themselves, so none of them change.
    */
-  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
+  checkAutomationKey?: (key: string, tool: string) => Promise<{ ok: boolean; channel?: string }>;
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit

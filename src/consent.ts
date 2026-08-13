@@ -36,6 +36,26 @@
 
 import { createHash, randomUUID } from "node:crypto";
 
+const GATE_DISABLED_ENV = "DOCS_MCP_GATE_DISABLED";
+
+/**
+ * Аварийный общий выключатель гейта подтверждения — 2026-08-12, по прямой
+ * просьбе Максима после разговора о том, что несколько MCP-серверов
+ * выключаются НЕ одним переключателем (см. аналог в ticktick-mcp/consent.py,
+ * `_gate_disabled` / `TICKTICK_MCP_GATE_DISABLED`). Точка отката ОДНА:
+ * переменная окружения, не правка кода — вернуть гейт можно, просто убрав
+ * переменную в Railway, без нового деплоя.
+ *
+ * Дефолт — гейт ВКЛЮЧЁН (переменная не задана = поведение не меняется).
+ * Когда выключен — КАЖДАЯ мутация проходит без user_reply/кнопки в Telegram;
+ * это буквально то, от чего весь `requireConsent` защищает. Максим
+ * предупреждён и подтвердил явно после возражения.
+ */
+function gateDisabled(): boolean {
+  const v = (process.env[GATE_DISABLED_ENV] ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
 // ───────────────────────── Типы контракта ──────────────────────────────────
 
 /** Строка манифеста, как её хранит и отдаёт store. Времена — epoch-миллисекунды. */
@@ -552,6 +572,29 @@ export async function requireConsent<T = unknown>(
   const userReply = p.userReply ?? "";
   const hasId = manifestId !== "";
   const hasReply = userReply !== "";
+
+  if (gateDisabled()) {
+    console.error(
+      `🔓 ГЕЙТ ВЫКЛЮЧЕН переключателем ${GATE_DISABLED_ENV}: действие ` +
+        `'${tool}' (account=${accountLabel}) выполнено БЕЗ подтверждения пользователя.`,
+    );
+    const built = await plan();
+    const auditId = randomUUID();
+    await store.appendConsentAudit({
+      id: auditId,
+      ts: now(),
+      server: cfg.server,
+      tool,
+      accountLabel,
+      manifestId: null,
+      objectHash: built.objectHash,
+      userReply,
+      checks: { gate: "disabled_switch" },
+      outcome: "confirmed",
+      actor: "human",
+    });
+    return { kind: "confirmed", manifestId: "gate_disabled_switch", payload: built.payload as T, auditId };
+  }
 
   // Общий журнал отказа + возврат refused.
   const refuse = async (

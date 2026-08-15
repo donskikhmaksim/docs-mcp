@@ -801,6 +801,49 @@ export async function updateConsentAuditOutcome(
   );
 }
 
+/**
+ * Последняя запись аудита ИСПОЛНЕНИЯ по манифесту — реализация опционального
+ * `ConsentStore.getExecutionAudit` (consent.ts, исход `already_executed`).
+ * Нужна sync-wait'у, чтобы вложить в отчёт модели ФАКТИЧЕСКИЙ результат
+ * (пруф post-verify), который тот, кто реально исполнил план (веб-хаб/поллер
+ * через `tryAutoExecute` + per-tool `execute`), до сих пор показывал только
+ * в браузере.
+ *
+ * Фильтры: свой `server` (общая таблица на 5 серверов) + ТОЛЬКО строки исхода
+ * мутации (`confirmed`/`failed`) — строки отказов гейта (`refused`/
+ * `invalidated`) по тому же манифесту сюда попадать не должны, иначе отчёт
+ * соврал бы про результат. Новейшая первой.
+ */
+export async function getExecutionAudit(
+  manifestId: string,
+  server: string,
+): Promise<{
+  id: string;
+  outcome: string;
+  postVerifyResult: string | null;
+  error: string | null;
+  actor: string | null;
+} | null> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT id, outcome, post_verify_result, error, actor
+       FROM consent_audit
+      WHERE manifest_id = $1 AND server = $2 AND outcome IN ('confirmed', 'failed')
+      ORDER BY ts DESC
+      LIMIT 1`,
+    [manifestId, server],
+  );
+  const row = res.rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    outcome: row.outcome,
+    postVerifyResult: row.post_verify_result ?? null,
+    error: row.error ?? null,
+    actor: row.actor ?? null,
+  };
+}
+
 export interface ConsentAuditFilters {
   server: string;
   since?: number;

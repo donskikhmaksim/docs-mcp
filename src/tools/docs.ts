@@ -4,7 +4,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { docs_v1 } from "googleapis";
-import { ok, fail, guard, safeText, mapWithLimit } from "../util.js";
+import { ok, okReport, okRefusal, fail, guard, safeText, mapWithLimit } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import {
@@ -1102,7 +1102,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeCreateBatchCore(g, payload, auditId, consentStore);
@@ -1195,7 +1200,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeAppendBatchCore(g, payload, auditId, consentStore);
@@ -1285,7 +1295,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeInsertBatchCore(g, payload, auditId, consentStore);
@@ -1380,7 +1395,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeReplaceBatchCore(g, payload, auditId, consentStore);
@@ -1491,7 +1511,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeRawBatchBatchCore(g, payload, auditId, consentStore);

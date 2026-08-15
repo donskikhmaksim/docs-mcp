@@ -159,6 +159,40 @@ export interface ConsentStore {
       preSnapshot?: unknown;
     },
   ): Promise<void>;
+
+  /**
+   * ОПЦИОНАЛЬНО (добавлено 2026-08-14 вместе с исходом `already_executed`).
+   * Возвращает последнюю запись аудита ИСПОЛНЕНИЯ по этому манифесту — ту,
+   * что написал тот, кто реально исполнил мутацию (веб-хаб/поллер через
+   * `tryAutoExecute`), уже дополненную `post_verify_result`/`error` через
+   * `updateConsentAuditOutcome`. Нужна ровно для одного: когда sync-wait
+   * видит чужой DONE, вернуть модели ФАКТИЧЕСКИЙ результат, а не голое «уже
+   * исполнено через другой канал» (отчёт с пруфом уходил только в браузер).
+   *
+   * Метод опционален СПЕЦИАЛЬНО: сторы, где он не реализован (офлайн-фейки в
+   * тестах, ещё не обновлённые репо), продолжают работать байт-в-байт — отчёт
+   * тогда честно говорит «результат не удалось перепроверить», а не выдумывает
+   * успех. Реализация обязана фильтровать по `server` (общая таблица) и брать
+   * ТОЛЬКО строки исхода мутации (`outcome IN ('confirmed','failed')`), иначе
+   * можно вернуть строку отказа гейта, относящуюся к тому же манифесту.
+   */
+  getExecutionAudit?(
+    manifestId: string,
+    server: string,
+  ): Promise<ConsentExecutionAudit | null>;
+}
+
+/** Строка аудита ИСПОЛНЕНИЯ, как её отдаёт опциональный `getExecutionAudit`. */
+export interface ConsentExecutionAudit {
+  id: string;
+  /** "confirmed" — мутация прошла; "failed" — упала (дописывает тул). */
+  outcome: string;
+  /** Текст пруфа post-verify, если тул его записал. */
+  postVerifyResult?: string | null;
+  /** Текст ошибки, если мутация упала. */
+  error?: string | null;
+  /** Кто исполнил: "web" / "tg_auto" / "human" — для честности отчёта. */
+  actor?: string | null;
 }
 
 /**
@@ -329,10 +363,30 @@ export interface RequireConsentParams<T = unknown> {
   checkAutomationKey?: (key: string, tool: string) => Promise<{ ok: boolean; channel?: string }>;
 }
 
-/** Размеченный union исхода. Отказы — здесь, НЕ через throw. */
+/**
+ * Размеченный union исхода. Отказы — здесь, НЕ через throw.
+ *
+ * `already_executed` (2026-08-14) — ЧЕТВЁРТЫЙ исход, добавленный после жалобы
+ * Максима: он подтверждал действие в веб-портале за 2 секунды, запрос из
+ * портала исчезал, а модель шла на второй/третий круг и слала запрос заново.
+ * Причина: положительный исход sync-wait («уже исполнено другим каналом»)
+ * возвращался в ФОРМЕ отказа (`{kind:"refused"}` с позитивным текстом), и
+ * модель, видя «отказ», честно повторяла вызов. Защита от двойного
+ * исполнения при этом была нужна и остаётся: этот kind, как и `refused`,
+ * НИКОГДА не даёт вызывающему тулу payload — исполнять нечего, мутация уже
+ * произошла в другом канале. Отличие только в честности сигнала: это ОТЧЁТ
+ * ОБ ИСПОЛНЕНИИ (`report`), а не отказ, и call site обязан отдать его с
+ * меткой, отличной от «refusal» (см. `okReport` в `src/util.ts`).
+ *
+ * `auditId` — id аудит-строки ТОГО, кто реально исполнил (веб-хаб/поллер
+ * через `tryAutoExecute`); опционален, потому что стор может не уметь её
+ * найти (метод `getExecutionAudit` опционален) — тогда отчёт честно скажет,
+ * что результат перепроверить не удалось, а не соврёт про успех.
+ */
 export type ConsentDecision<T = unknown> =
   | { kind: "planned"; manifestId: string; preview: string }
   | { kind: "confirmed"; manifestId: string; payload: T; auditId: string }
+  | { kind: "already_executed"; manifestId: string; report: string; auditId?: string }
   | { kind: "refused"; result: string };
 
 /**
@@ -411,6 +465,100 @@ function renderPlanned(previewBody: string, id: string, expiresAt: number): stri
 function renderRefusal(header: string, body: string): string {
   // 🛑 — «жёсткий стоп, ничего не изменено» (output-format §7.2).
   return renderConsentBlock(`🛑 ${header}`, body);
+}
+
+/** Кап на чужой текст пруфа внутри отчёта — не даём одному post-verify
+ * раздуть ответ модели до неприличия. Пруф генерирует наш же тул, поэтому
+ * нейтрализация markdown тут не нужна (внешние строки внутри него уже
+ * прошли `safeText` при формировании отчёта), нужен только предел длины. */
+function clampProof(s: string, max = 2000): string {
+  const t = s.trim();
+  return t.length > max ? t.slice(0, max) + "\n…(пруф обрезан)" : t;
+}
+
+/**
+ * Собирает ОТЧЁТ ОБ ИСПОЛНЕНИИ для исхода `already_executed`: мутацию уже
+ * сделал другой канал (веб-хаб `POST /pending-consents/decide` или поллер
+ * ТГ-кнопки — оба через `tryAutoExecute` + per-tool `execute`), пока этот
+ * вызов ждал в sync-wait.
+ *
+ * ЗАЧЕМ ХОДИМ В АУДИТ: тот, кто исполнил, вернул человекочитаемый отчёт с
+ * пруфом post-verify В БРАУЗЕР, а модель до этой правки получала только
+ * «уже исполнено через другой канал» — то есть не знала, ЧТО именно
+ * получилось. Пруф лежит в `consent_audit.post_verify_result` той самой
+ * аудит-строки, которую создал `tryAutoExecute` (её id — `auditId`), поэтому
+ * читаем её и вкладываем в текст. Нет данных (стор не умеет / строки нет /
+ * пруф не записан) — пишем это ЧЕСТНО, а не подразумеваем успех.
+ */
+async function buildAlreadyExecutedReport(args: {
+  manifestId: string;
+  previewBody: string;
+  bindingOk: boolean;
+  store: ConsentStore;
+  server: string;
+}): Promise<{ report: string; auditId?: string }> {
+  const { manifestId, previewBody, bindingOk, store, server } = args;
+
+  let audit: ConsentExecutionAudit | null = null;
+  if (store.getExecutionAudit) {
+    try {
+      audit = await store.getExecutionAudit(manifestId, server);
+    } catch (err) {
+      // Fail-soft ТОЛЬКО для обогащения текста: сам факт исполнения уже
+      // установлен статусом манифеста (DONE), и подавление ошибки чтения
+      // аудита не может привести к повторной мутации — payload наружу не
+      // отдаётся ни в одной ветке этой функции.
+      console.error(
+        `consent: не смог прочитать аудит исполнения манифеста ${manifestId}: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+      audit = null;
+    }
+  }
+
+  const failed =
+    audit != null && (audit.outcome === "failed" || (audit.error != null && audit.error !== ""));
+  const header = failed
+    ? "⚠️ Подтверждено, но исполнение завершилось ошибкой"
+    : bindingOk
+      ? "✅ Подтверждено и исполнено"
+      : "⚠️ Подтверждено и исполнено, но состояние изменилось";
+
+  let outcomeBlock: string;
+  if (failed) {
+    const errText = audit?.error ? inlineReply(audit.error, 300) : "текст ошибки не записан";
+    outcomeBlock =
+      `**Фактический результат:** мутация была запущена другим каналом и ЗАВЕРШИЛАСЬ ОШИБКОЙ — ${errText}. ` +
+      "Часть изменений могла всё же примениться — проверь состояние объектов, прежде чем повторять." +
+      (audit?.postVerifyResult ? `\n\n${clampProof(audit.postVerifyResult)}` : "");
+  } else if (audit?.postVerifyResult) {
+    outcomeBlock = `**Фактический результат (пруф post-verify от исполнившего канала):**\n\n${clampProof(
+      audit.postVerifyResult,
+    )}`;
+  } else if (audit) {
+    outcomeBlock =
+      `**Фактический результат:** не удалось перепроверить — запись об исполнении есть ` +
+      `(аудит \`${audit.id}\`${audit.actor ? `, канал «${audit.actor}»` : ""}), но пруф post-verify в ней ` +
+      "отсутствует. Действие исполнено, его итог сервер подтвердить сейчас не может — проверь объект отдельно.";
+  } else {
+    outcomeBlock =
+      "**Фактический результат:** не удалось перепроверить — сервер не нашёл записи об исполнении этого " +
+      "плана в аудит-логе. План закрыт как исполненный, но чем именно он закончился, сервер сейчас сказать " +
+      "не может — проверь объект отдельно.";
+  }
+
+  const drift = bindingOk
+    ? ""
+    : "\n\nСостояние окружения с момента построения плана успело измениться — фактический результат мог не " +
+      "совпасть с тем, что показано в плане выше.";
+
+  const body =
+    `${previewBody}\n\nРешение по этому плану уже принято, и мутация УЖЕ ВЫПОЛНЕНА другим каналом ` +
+    "(веб-подтверждение или кнопка в Telegram), пока шло ожидание ответа. Это ОТЧЁТ ОБ ИСПОЛНЕНИИ, а не " +
+    "отказ: повторять вызов этого инструмента с этим планом НЕ нужно и НЕЛЬЗЯ — второй вызов сделал бы " +
+    `действие дважды.${drift}\n\n${outcomeBlock}`;
+
+  return { report: renderConsentBlock(header, body), auditId: audit?.id };
 }
 
 /**
@@ -771,29 +919,39 @@ export async function requireConsent<T = unknown>(
         // полосы (веб-хаб /pending-consents/decide — тот же атомарный
         // consumeManifest, что и у авто-исполнения по кнопке в Telegram).
         //
-        // ИСПРАВЛЕНО (было: возврат {kind:"confirmed"}, что вело к
-        // ПОВТОРНОМУ исполнению мутации вызывающим тулом — веб-хаб уже
-        // исполнил её синхронно внутри своего HTTP-запроса, ДО того, как
-        // consumeManifest вообще стал виден этому опросу). ЭТА ветка теперь
-        // ТОЛЬКО ЧИТАЕТ и НИКОГДА не даёт вызывающему тулу сигнал исполнять
-        // ещё раз — положительный исход оборачивается в ту же ФОРМУ, что и
-        // обычный отказ ({kind:"refused"}): у ВСЕХ call site'ов уже есть `if
-        // (kind==="refused") return ok(result)`, то есть тул просто
-        // ретранслирует текст модели БЕЗ повторного исполнения payload.
+        // ЗАЩИТА ОТ ДВОЙНОГО ИСПОЛНЕНИЯ (не менять!): здесь НИКОГДА не
+        // возвращается {kind:"confirmed"} — это заставило бы вызывающий тул
+        // исполнить мутацию ВТОРОЙ раз поверх уже исполненной веб-хабом. Эта
+        // ветка ТОЛЬКО ЧИТАЕТ и не отдаёт payload наружу.
+        //
+        // ИСПРАВЛЕНО 2026-08-14: раньше положительный исход возвращался в
+        // ФОРМЕ отказа ({kind:"refused"} с позитивным текстом внутри) — тул
+        // отдавал его модели как отказ, и модель добросовестно шла на второй
+        // круг «запроси подтверждение снова» (жалоба Максима: подтвердил в
+        // портале за 2 секунды, а Claude всё равно спрашивает опять).
+        // Теперь это отдельный честный исход `already_executed`: та же
+        // защита (payload не отдаётся), но модели говорят правду — действие
+        // ВЫПОЛНЕНО, вот отчёт.
+        //
         // Аудит-запись за это исполнение уже написал ТОТ, кто реально
-        // исполнил (веб-хаб через tryAutoExecute) — здесь новую не пишем,
-        // чтобы не задваивать аудит-лог.
+        // исполнил (веб-хаб через tryAutoExecute) — новую здесь не пишем,
+        // чтобы не задваивать аудит-лог; её только ЧИТАЕМ, чтобы вложить в
+        // отчёт фактический результат (post-verify), а не голое «исполнено».
         const currentHash = await rehash(row.payload as ConsentAddressing);
         const bindingOk = currentHash === row.objectHash;
-        const header = bindingOk ? "✅ Подтверждено и исполнено" : "⚠️ Подтверждено, но состояние изменилось";
-        const body = bindingOk
-          ? `${previewBody}\n\nРешение по этому плану уже принято и исполнено через другой канал ` +
-            "(например, веб-подтверждение), пока шло ожидание ответа. Повторно вызывать этот инструмент " +
-            "с этим планом не нужно."
-          : `${previewBody}\n\nДействие было подтверждено и исполнено через другой канал, но состояние ` +
-            "окружения с момента построения плана уже успело измениться — фактический результат мог не " +
-            "совпасть с тем, что показано в плане выше. Проверьте результат отдельно.";
-        return { kind: "refused", result: renderConsentBlock(header, body) };
+        const built2 = await buildAlreadyExecutedReport({
+          manifestId: id,
+          previewBody,
+          bindingOk,
+          store,
+          server: cfg.server,
+        });
+        return {
+          kind: "already_executed",
+          manifestId: id,
+          report: built2.report,
+          auditId: built2.auditId,
+        };
       }
       // Дедлайн истёк, манифест всё ещё AWAITING_CONSENT — не ошибка, ничего
       // не потеряно: падаем на обычное превью ниже, как и раньше.

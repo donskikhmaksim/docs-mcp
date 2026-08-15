@@ -9,6 +9,31 @@ export function ok(data: unknown): CallToolResult {
   return { content: [{ type: "text", text }] };
 }
 
+/**
+ * Ответ-ОТЧЁТ ОБ ИСПОЛНЕНИИ (`ConsentDecision.kind === "already_executed"`):
+ * действие УЖЕ выполнено другим каналом (веб-хаб/кнопка в Telegram), тул
+ * ничего не мутировал и мутировать не должен, но модели надо сказать правду —
+ * «сделано, вот результат», а не «отказ».
+ *
+ * `_meta.kind = "execution-report"` — машиночитаемая метка, СПЕЦИАЛЬНО
+ * отличная от `"refusal"` у `okRefusal` ниже: раньше положительный исход
+ * ехал в форме отказа, и модель повторяла вызов по кругу (жалоба Максима
+ * 2026-08-14). Текст остаётся первым (и единственным) content-блоком —
+ * клиенты, которые `_meta` игнорируют, видят ровно то же, что и раньше.
+ */
+export function okReport(text: string): CallToolResult {
+  return { content: [{ type: "text", text }], _meta: { kind: "execution-report" } };
+}
+
+/**
+ * Ответ-ОТКАЗ гейта (`ConsentDecision.kind === "refused"`): ничего не
+ * выполнено. `_meta.kind = "refusal"` — та самая метка, от которой отчёт об
+ * исполнении обязан отличаться.
+ */
+export function okRefusal(text: string): CallToolResult {
+  return { content: [{ type: "text", text }], _meta: { kind: "refusal" } };
+}
+
 export function fail(error: unknown): CallToolResult {
   const e = error as { message?: string; errors?: unknown; code?: unknown };
   const message =

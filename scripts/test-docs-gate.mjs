@@ -127,6 +127,14 @@ async function harness(world, cfgOverrides = {}) {
       const a = audits.find((x) => x.id === auditId);
       if (a) Object.assign(a, outcome);
     },
+    // Опциональный метод контракта consent.ts — из него sync-wait достаёт
+    // пруф post-verify чужого исполнения для отчёта `already_executed`.
+    async getExecutionAudit(manifestId, server) {
+      const a = [...audits]
+        .reverse()
+        .find((x) => x.manifestId === manifestId && x.server === server && (x.outcome === "confirmed" || x.outcome === "failed"));
+      return a ? { id: a.id, outcome: a.outcome, postVerifyResult: a.postVerify ?? null, error: a.error ?? null, actor: a.actor ?? null } : null;
+    },
   };
   const consentCtx = {
     consentStore,
@@ -241,6 +249,20 @@ console.log("\n[4] docs_append_text: подтверждено и исполне�
         bumpRev(d);
         const id = [...manifestsRef.keys()][0];
         await consentStoreRef.consumeManifest(id, "docs", "[веб-хаб: подтверждено]");
+        // …и пишет свою аудит-строку с пруфом post-verify — как настоящий
+        // `tryAutoExecute` + per-tool `execute` (именно её sync-wait читает,
+        // чтобы донести до модели ФАКТИЧЕСКИЙ результат, а не голое
+        // «исполнено через другой канал»).
+        await consentStoreRef.appendConsentAudit({
+          id: "audit-hub-1", ts: Date.now(), server: "docs", tool: "docs_append_text",
+          accountLabel: "work", manifestId: id, objectHash: null,
+          userReply: "[веб-хаб: подтверждено]", checks: { source: "web_hub" },
+          outcome: "confirmed", actor: "web",
+        });
+        await consentStoreRef.updateConsentAuditOutcome("audit-hub-1", {
+          outcome: "confirmed",
+          postVerify: "### 🧾 Независимая проверка добавления текста\n\n- ✅ «My Doc»: текст на месте",
+        });
       }
     },
   };
@@ -258,6 +280,18 @@ console.log("\n[4] docs_append_text: подтверждено и исполне�
   const occurrences = (world.docs.get("D1").text.match(/confirmed via hub/g) || []).length;
   check("мутация произошла РОВНО ОДИН раз (не задвоена вызывающим тулом)", occurrences === 1, `occurrences=${occurrences}`);
   check("ровно 2 итерации опроса (подтверждено на 2-й)", ticks === 2, `ticks=${ticks}`);
+  // Главное в правке 2026-08-14: модель больше не получает положительный
+  // исход в форме ОТКАЗА — иначе она видит «отказ» и шлёт запрос заново по
+  // кругу (жалоба Максима).
+  check("_meta.kind = 'execution-report' (НЕ 'refusal')", planResp._meta?.kind === "execution-report", JSON.stringify(planResp._meta));
+  check("отчёт НЕ помечен 🛑 (это не отказ)", !planBody.includes("🛑"), planBody.slice(0, 120));
+  check("ФАКТИЧЕСКИЙ результат (пруф post-verify исполнившего канала) донесён до модели", planBody.includes("Независимая проверка добавления текста"), planBody.slice(-300));
+  check("модели прямо сказано не повторять вызов", planBody.includes("повторять вызов"), planBody.slice(-400));
+
+  // Регресс на настоящий ОТКАЗ: он обязан остаться отказом с меткой "refusal".
+  const refusedResp = await cli.callTool({ name: "docs_append_text", arguments: { manifest_id: "нет-такого", user_reply: "да" } });
+  check("настоящий отказ по-прежнему помечен _meta.kind='refusal'", refusedResp._meta?.kind === "refusal", JSON.stringify(refusedResp._meta));
+  check("настоящий отказ по-прежнему несёт 🛑", text(refusedResp).includes("🛑"), text(refusedResp).slice(0, 80));
 }
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);

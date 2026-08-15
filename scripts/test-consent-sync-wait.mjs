@@ -73,7 +73,44 @@ function makeStore() {
       const a = audits.find((x) => x.id === auditId);
       if (a) Object.assign(a, outcome);
     },
+    // Опциональный метод контракта (consent.ts) — им sync-wait достаёт
+    // ФАКТИЧЕСКИЙ результат чужого исполнения (пруф post-verify), чтобы
+    // отчёт модели не был голым «исполнено где-то там».
+    async getExecutionAudit(manifestId, server) {
+      const a = [...audits]
+        .reverse()
+        .find(
+          (x) =>
+            x.manifestId === manifestId &&
+            x.server === server &&
+            (x.outcome === "confirmed" || x.outcome === "failed"),
+        );
+      return a ? { id: a.id, outcome: a.outcome, postVerifyResult: a.postVerify ?? null, error: a.error ?? null, actor: a.actor ?? null } : null;
+    },
   };
+}
+
+/** Симуляция того, что делает веб-хаб (`POST /pending-consents/decide`):
+ * атомарно консьюмит манифест, пишет аудит-строку исполнения и дописывает в
+ * неё пруф post-verify — ровно как `tryAutoExecute` + per-tool `execute`. */
+async function simulateWebHubExecute(store, id, { postVerify = null, error = null } = {}) {
+  await store.consumeManifest(id, "docs", "[веб-хаб: подтверждено]");
+  const auditId = "audit-" + id.slice(0, 8);
+  await store.appendConsentAudit({
+    id: auditId,
+    ts: 1,
+    server: "docs",
+    tool: "docs_replace_text",
+    accountLabel: "work",
+    manifestId: id,
+    objectHash: OBJHASH,
+    userReply: "[веб-хаб: подтверждено]",
+    checks: { source: "web_hub" },
+    outcome: error ? "failed" : "confirmed",
+    actor: "web",
+  });
+  await store.updateConsentAuditOutcome(auditId, { postVerify, error, outcome: error ? "failed" : "confirmed" });
+  return auditId;
 }
 
 const PAYLOAD = { account: "work", items: [{ documentId: "DOC1", find: "2025", replace: "2026" }] };
@@ -125,20 +162,66 @@ console.log("\n[2] подтверждено «человеком» в серед
       // итерации опроса — тот же путь, что `POST /pending-consents/decide`
       // (consumeManifest + реальная мутация уже произошли ТАМ, синхронно).
       const id = [...store.manifests.keys()][0];
-      await store.consumeManifest(id, "docs", "[веб-хаб: подтверждено]");
+      await simulateWebHubExecute(store, id, {
+        postVerify: "### 🧾 Независимая проверка замены текста\n\n- ✅ «DOC1»: 3 замены «2025» → «2026»",
+      });
     }
   };
   cfg.sleep = sleepAndMaybeConfirm;
   const dec = await requireConsent({ tool: "docs_replace_text", accountLabel: "work", plan, rehash: rehashOk, store, cfg });
-  // ИСПРАВЛЕНО (был баг двойного исполнения): наблюдение чужого DONE НЕ
+  // ЗАЩИТА ОТ ДВОЙНОГО ИСПОЛНЕНИЯ (не менять): наблюдение чужого DONE НЕ
   // может вернуть kind=confirmed — тул тогда исполнил бы мутацию ВТОРОЙ раз
-  // поверх уже исполненной веб-хабом. Правильный контракт — та же форма,
-  // что у обычного отказа (`if (kind==="refused") return ok(result)` во
-  // всех call site'ах уже есть), с позитивным текстом внутри.
-  check("kind=refused (безопасная форма — тул не исполнит payload повторно)", dec.kind === "refused", JSON.stringify(dec).slice(0, 100));
+  // поверх уже исполненной веб-хабом. Но и `refused` (как было до
+  // 2026-08-14) — ложь: модель видела «отказ» и повторяла вызов по кругу.
+  // Правильный контракт — отдельный исход `already_executed`: payload наружу
+  // НЕ отдаётся, а модели говорится правда «сделано, вот результат».
+  check("kind=already_executed (не refused и не confirmed)", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+  check("payload НЕ отдан наружу (тул физически не может исполнить повторно)", dec.payload === undefined);
   check("тул получил ответ С ПЕРВОГО вызова (одна инвокация requireConsent)", ticks === 2, `ticks=${ticks}`);
-  check("текст сообщает, что уже подтверждено и исполнено", dec.result.includes("одтвержд") && dec.result.includes("исполнен"), dec.result.slice(0, 100));
+  check("текст сообщает, что уже подтверждено и исполнено", dec.report.includes("одтвержд") && dec.report.includes("ВЫПОЛНЕНА"), dec.report.slice(0, 160));
+  check("текст прямо запрещает повторный вызов", dec.report.includes("повторять вызов") || dec.report.includes("НЕ нужно"), dec.report.slice(0, 300));
+  check("ФАКТИЧЕСКИЙ результат (пруф post-verify) донесён до модели", dec.report.includes("Независимая проверка замены текста") && dec.report.includes("3 замены"), dec.report.slice(-300));
+  check("auditId исполнившего канала возвращён", typeof dec.auditId === "string" && dec.auditId.startsWith("audit-"), String(dec.auditId));
   check("манифест реально DONE (исполнил веб-хаб, не requireConsent)", store.manifests.get([...store.manifests.keys()][0]).status === "DONE");
+}
+
+// ── [2a] то же, но стор НЕ умеет отдать аудит — честное «не перепроверил» ───
+console.log("\n[2a] чужой DONE, но пруфа исполнения достать неоткуда — отчёт честно говорит, что результат не перепроверен (и НЕ выдумывает успех)");
+{
+  const { clock, sleep } = makeClock();
+  const store = makeStore();
+  delete store.getExecutionAudit; // стор старого образца / метод не реализован
+  const cfg = baseCfg(clock, { syncWaitMs: 25_000, syncPollMs: 1_000 });
+  let ticks = 0;
+  cfg.sleep = async (ms) => {
+    ticks++;
+    await sleep(ms);
+    if (ticks === 2) await store.consumeManifest([...store.manifests.keys()][0], "docs", "[веб-хаб: подтверждено]");
+  };
+  const dec = await requireConsent({ tool: "docs_replace_text", accountLabel: "work", plan, rehash: rehashOk, store, cfg });
+  check("kind=already_executed", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+  check("честно сказано, что результат не удалось перепроверить", dec.report.includes("не удалось перепроверить"), dec.report.slice(-300));
+  check("auditId отсутствует (нечего вернуть)", dec.auditId === undefined);
+}
+
+// ── [2b] чужое исполнение УПАЛО — отчёт не притворяется успехом ─────────────
+console.log("\n[2b] чужой канал исполнил с ОШИБКОЙ — отчёт помечен ⚠️ и называет ошибку, а не рапортует успех");
+{
+  const { clock, sleep } = makeClock();
+  const store = makeStore();
+  const cfg = baseCfg(clock, { syncWaitMs: 25_000, syncPollMs: 1_000 });
+  let ticks = 0;
+  cfg.sleep = async (ms) => {
+    ticks++;
+    await sleep(ms);
+    if (ticks === 2) {
+      await simulateWebHubExecute(store, [...store.manifests.keys()][0], { error: "Google API 403: insufficient permissions" });
+    }
+  };
+  const dec = await requireConsent({ tool: "docs_replace_text", accountLabel: "work", plan, rehash: rehashOk, store, cfg });
+  check("kind=already_executed", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+  check("заголовок ⚠️, а не ✅", dec.report.includes("⚠️") && !dec.report.includes("✅"), dec.report.slice(0, 120));
+  check("текст ошибки донесён до модели", dec.report.includes("403"), dec.report.slice(-300));
 }
 
 // ── [3] отклонено в окне — refused, мутации нет ──────────────────────────────
@@ -201,8 +284,11 @@ console.log("\n[5] sync-путь: rehash не совпал (дрейф сост�
   const cfg = baseCfg(clock, { syncWaitMs: 25_000, syncPollMs: 1_000, sleep: sleepAndMaybeConfirm });
   const changedRehash = () => sha256({ changed: true }); // "документ изменился между планом и подтверждением"
   const dec = await requireConsent({ tool: "docs_replace_text", accountLabel: "work", plan, rehash: changedRehash, store, cfg });
-  check("kind=refused (состояние изменилось)", dec.kind === "refused", JSON.stringify(dec).slice(0, 100));
-  check("текст отказа называет причину", dec.result.includes("изменил"), dec.result.slice(0, 80));
+  // Мутацию уже сделал чужой канал — «отказать» тут не от чего (действие
+  // произошло), но и молчать о дрейфе нельзя: отчёт помечается ⚠️.
+  check("kind=already_executed (действие уже случилось, повторять нечего)", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+  check("payload НЕ отдан (двойного исполнения не будет)", dec.payload === undefined);
+  check("отчёт помечен ⚠️ и называет дрейф состояния", dec.report.includes("⚠️") && dec.report.includes("изменил"), dec.report.slice(0, 200));
 }
 
 // ── [6] automation_key + sync одновременно — automation_key исполняет СРАЗУ ──

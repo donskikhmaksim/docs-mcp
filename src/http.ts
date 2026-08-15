@@ -22,8 +22,8 @@ import { renderDashboard } from "./dashboard.js";
 import { logDashboardLocation } from "./logRedaction.js";
 import { buildUserClients } from "./accounts.js";
 import { handleWebhook, registerWebhook, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
-import { tryAutoExecute } from "./consent.js";
-import { getAutoExecutor, type AutoExecutorCtx } from "./autoExecute.js";
+import { tryAutoExecute, stripUrlQuery } from "./consent.js";
+import { getAutoExecutor, runAutoExecutorSafely, type AutoExecutorCtx } from "./autoExecute.js";
 import { listGatedTools } from "./gated_tools_catalog.js";
 import { AUTOMATION_SERVICE } from "./automation_key.js";
 import { safeText } from "./util.js";
@@ -261,6 +261,14 @@ export interface PendingConsentsDeps {
   getAutoExecutor: (tool: string) => ReturnType<typeof getAutoExecutor>;
   tryAutoExecute: typeof tryAutoExecute;
   buildCtx: (config: Config) => Promise<AutoExecutorCtx | null>;
+  /** Пишет исход исполнения в аудит-строку — нужна `runAutoExecutorSafely`
+   * (autoExecute.ts), которую зовёт `handlePendingConsentsDecide` ниже, чтобы
+   * ЛЮБОЕ исключение из `executor.execute` (не только явный отрицательный
+   * результат) гарантированно фиксировалось как `outcome:"failed"`, а не
+   * оставляло аудит на "confirmed" без пруфа. DI отдельным полем (а не через
+   * целый `ConsentStore`), чтобы тесты могли подставить фейк без реального
+   * Postgres. */
+  updateConsentAuditOutcome: typeof consentStoreAdapter.updateConsentAuditOutcome;
   server: string;
   now: () => number;
   makeId: () => string;
@@ -276,6 +284,7 @@ const pendingConsentsDeps: PendingConsentsDeps = {
   getAutoExecutor,
   tryAutoExecute,
   buildCtx: buildAutoExecuteCtx,
+  updateConsentAuditOutcome: consentStoreAdapter.updateConsentAuditOutcome,
   server: consentServerConfig.server,
   now: Date.now,
   makeId: randomUUID,
@@ -355,7 +364,22 @@ export async function handlePendingConsentsDecide(
     // из 4 машиночитаемых кодов, который сюда честно подходит.
     return { status: 409, body: { error: "binding_mismatch" } };
   }
-  const reportText = await executor.execute(result.payload, result.auditId, ctx);
+  let reportText: string;
+  try {
+    reportText = await runAutoExecutorSafely(executor, result.payload, result.auditId, ctx, deps.updateConsentAuditOutcome);
+  } catch (err) {
+    // `runAutoExecutorSafely` уже дописала outcome:"failed" в аудит-строку
+    // (см. её doc-comment) — здесь только решаем, что вернуть по HTTP.
+    // НЕ пересказываем `err.message` наружу дословно (security-checklist.md
+    // §6 — может содержать URL нижележащего API с query/токеном): хаб
+    // получает машиночитаемый статус, полный текст остаётся в аудит-логе
+    // (уже прогнан через `stripUrlQuery` внутри обёртки).
+    console.error(
+      `POST /pending-consents/decide: execute упал для ${row.tool}/${manifestId}:`,
+      stripUrlQuery(err instanceof Error ? err.message : String(err)),
+    );
+    return { status: 200, body: { ok: false, outcome: "execution_failed" } };
+  }
   return { status: 200, body: { ok: true, outcome: "confirmed", result: reportText } };
 }
 
@@ -409,7 +433,13 @@ async function runAutoExecutePoller(config: Config): Promise<void> {
         ctx,
       );
       if (!result) continue; // гонка/дрейф/истёк — тихо пропускаем, это не ошибка
-      const reportText = await executor.execute(result.payload, result.auditId, ctx);
+      const reportText = await runAutoExecutorSafely(
+        executor,
+        result.payload,
+        result.auditId,
+        ctx,
+        consentStoreAdapter.updateConsentAuditOutcome,
+      );
       await reportAutoExecutionResult(tgApprovalConfig, c.chatId, c.messageId, reportText);
     } catch (err) {
       console.error(`TG auto-execute: ошибка при исполнении ${c.tool}/${c.manifestId}:`, err);
@@ -417,9 +447,13 @@ async function runAutoExecutePoller(config: Config): Promise<void> {
       // успел вызвать consumeManifest (манифест одноразовый), повторной
       // попытки уже не будет; отчёт об ошибке всё равно стоит попытаться
       // отправить, чтобы Максим не остался с зависшими кнопками в боте.
+      // stripUrlQuery — тот же санитайзер, что и в decide-route выше: текст
+      // ошибки нижележащего API уходит в Telegram (внешний канал, не только
+      // серверный лог) и НЕ должен нести query-параметры чужих URL
+      // (security-checklist.md §6).
       await reportAutoExecutionResult(
         tgApprovalConfig, c.chatId, c.messageId,
-        `🛑 Ошибка при автоисполнении «${c.tool}»: ${err instanceof Error ? err.message : String(err)}`,
+        `🛑 Ошибка при автоисполнении «${c.tool}»: ${stripUrlQuery(err instanceof Error ? err.message : String(err))}`,
       ).catch(() => {});
     }
   }

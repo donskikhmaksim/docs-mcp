@@ -82,7 +82,7 @@ function makeManifest(overrides = {}) {
   };
 }
 
-function makeDeps(manifest, { executed = { count: 0 }, audits = [] } = {}) {
+function makeDeps(manifest, { executed = { count: 0 }, audits = [], executeImpl } = {}) {
   const manifests = new Map(manifest ? [[manifest.id, { ...manifest }]] : []);
   return {
     deps: {
@@ -106,10 +106,12 @@ function makeDeps(manifest, { executed = { count: 0 }, audits = [] } = {}) {
         tool === "docs_create"
           ? {
               rehash: async (addressing) => "hash1", // "мир не изменился"
-              execute: async (payload, auditId) => {
-                executed.count++;
-                return `### 📄 Создано 1/1\n\n- ✅ **«${payload.documents[0].title}»** — https://docs.google.com/x`;
-              },
+              execute:
+                executeImpl ??
+                (async (payload, auditId) => {
+                  executed.count++;
+                  return `### 📄 Создано 1/1\n\n- ✅ **«${payload.documents[0].title}»** — https://docs.google.com/x`;
+                }),
             }
           : undefined,
       tryAutoExecute: async (candidate, rehash, store, cfg, ctx) => {
@@ -122,6 +124,18 @@ function makeDeps(manifest, { executed = { count: 0 }, audits = [] } = {}) {
         return { manifestId: r.id, tool: r.tool, accountLabel: r.accountLabel, payload: r.payload, auditId: "audit-1" };
       },
       buildCtx: async () => ({ clients: {}, consentStore: {}, userToken: null }),
+      // Мок реального `consentStoreAdapter.updateConsentAuditOutcome` — то, что
+      // должна вызвать `runAutoExecutorSafely` (autoExecute.ts), КОГДА
+      // `executor.execute` бросает исключение (задача: гарантированный
+      // outcome:"failed" даже на брошенном исключении, не только на явном
+      // отрицательном результате). Пишет в тот же `audits`, что и
+      // `appendConsentAudit`, чтобы тест мог проверить итоговое состояние
+      // строки одним массивом.
+      updateConsentAuditOutcome: async (auditId, outcome) => {
+        const a = audits.find((x) => x.id === auditId);
+        if (a) Object.assign(a, outcome);
+        else audits.push({ id: auditId, ...outcome });
+      },
       server: "docs",
       now: () => 1_700_000_000_500,
       makeId: () => "audit-web-1",
@@ -158,6 +172,25 @@ console.log("\n[10] decide reject с комментарием — invalidated, �
   // Повторный reject на тот же манифест — тоже already_decided (атомарность).
   const second = await handlePendingConsentsDecide(deps, {}, { manifestId: "m2", decision: "reject", comment: "ещё раз" });
   check("повторный reject → 409 already_decided", second.status === 409 && second.body.error === "already_decided");
+}
+
+console.log("\n[12] decide confirm — executor.execute БРОСАЕТ исключение → аудит получает outcome:\"failed\" (не остаётся \"confirmed\" без пруфа), HTTP-ответ НЕ ok:true/confirmed, текст ошибки не пересказан наружу дословно");
+{
+  const audits = [];
+  const boom = new Error("Google API 403 at https://storage.googleapis.com/bucket/f?X-Goog-Signature=SECRETTOKEN123");
+  const { deps, manifests } = makeDeps(makeManifest({ id: "m6" }), {
+    audits,
+    executeImpl: async () => {
+      throw boom;
+    },
+  });
+  const dec = await handlePendingConsentsDecide(deps, {}, { manifestId: "m6", decision: "confirm", comment: "" });
+  check("НЕ 200/confirmed — исполнение упало", !(dec.status === 200 && dec.body.outcome === "confirmed"), JSON.stringify(dec));
+  check("HTTP-ответ не содержит текст исключения дословно (никакого SECRETTOKEN123)", !JSON.stringify(dec.body).includes("SECRETTOKEN123"), JSON.stringify(dec));
+  check("манифест всё равно DONE (consumeManifest — атомарный one-shot, произошёл ДО execute)", manifests.get("m6").status === "DONE");
+  const auditRow = audits.find((a) => a.id === "audit-1");
+  check("аудит-строка получила outcome:\"failed\" (гарантированно, несмотря на исключение)", !!auditRow && auditRow.outcome === "failed", JSON.stringify(auditRow));
+  check("текст ошибки в аудите есть, но query/токен из URL вырезаны", !!auditRow?.error && auditRow.error.includes("403") && !auditRow.error.includes("SECRETTOKEN123"), auditRow?.error);
 }
 
 console.log("\n[доп.] not_found / expired — честные машиночитаемые коды, не 500");

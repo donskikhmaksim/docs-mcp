@@ -20,6 +20,7 @@
 
 import type { UserClients } from "./accounts.js";
 import type { ConsentStore, ConsentAddressing } from "./consent.js";
+import { stripUrlQuery } from "./consent.js";
 
 export interface AutoExecutorCtx {
   clients: UserClients;
@@ -68,4 +69,53 @@ export function getAutoExecutor(tool: string): AutoExecutorEntry | undefined {
 
 export function registeredAutoExecuteTools(): string[] {
   return [...registry.keys()];
+}
+
+/**
+ * Исполняет `executor.execute` и ГАРАНТИРОВАННО фиксирует провал в
+ * аудит-строке ЛЮБЫМ путём отказа — включая брошенное исключение, а не
+ * только явный `outcome:"failed"`, который сам тул пишет ТОЛЬКО если успел
+ * дойти до своего собственного `buildMutationResult`/эквивалента (пакет A3).
+ * Без этой обёртки исключение, брошенное РАНЬШЕ той точки (сетевая ошибка на
+ * первом же API-вызове, необработанное исключение внутри `execute` до сборки
+ * отчёта), пролетает мимо `updateConsentAuditOutcome`, и аудит-строка,
+ * которую `tryAutoExecute` уже записал как `outcome:"confirmed"` (ДО всякого
+ * пруфа — см. её doc-comment в consent.ts), так и остаётся "confirmed" —
+ * ложный ✅, который потом читает `buildAlreadyExecutedReport`.
+ *
+ * Вызывающие (`http.ts`'s `handlePendingConsentsDecide`/`runAutoExecutePoller`)
+ * обязаны звать `execute` ТОЛЬКО через эту обёртку, никогда напрямую через
+ * `executor.execute(...)`.
+ *
+ * `err` пробрасывается дальше НЕ модифицированным — обёртка только
+ * гарантирует побочный эффект (аудит), решение, что показать пользователю/
+ * модели по этому исключению, остаётся за вызывающим кодом (который уже
+ * обязан не пересказывать `err.message` дословно наружу — security-checklist
+ * §6 — поэтому текст, уходящий в САМ аудит, тоже прогнан через
+ * `stripUrlQuery`, defense-in-depth: аудит не «лог» в смысле checklist, но
+ * тот же принцип «меньше сырых секретов на диске» уместен и здесь).
+ */
+export async function runAutoExecutorSafely(
+  executor: AutoExecutorEntry,
+  payload: unknown,
+  auditId: string,
+  ctx: AutoExecutorCtx,
+  updateConsentAuditOutcome: ConsentStore["updateConsentAuditOutcome"],
+): Promise<string> {
+  try {
+    return await executor.execute(payload, auditId, ctx);
+  } catch (err) {
+    const raw = err instanceof Error ? err.message : String(err);
+    try {
+      await updateConsentAuditOutcome(auditId, { outcome: "failed", error: stripUrlQuery(raw) });
+    } catch (auditErr) {
+      // Не удалось даже это дописать — не глотаем, но и не заменяем ей
+      // оригинальное исключение мутации (то, что реально важно вызывающему).
+      console.error(
+        `autoExecute: не смог записать outcome:"failed" в аудит ${auditId}: ` +
+          (auditErr instanceof Error ? auditErr.message : String(auditErr)),
+      );
+    }
+    throw err;
+  }
 }

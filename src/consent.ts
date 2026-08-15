@@ -476,6 +476,36 @@ function clampProof(s: string, max = 2000): string {
   return t.length > max ? t.slice(0, max) + "\n…(пруф обрезан)" : t;
 }
 
+/** Вырезает query-параметры у http(s)-URL внутри произвольного текста (хост+
+ * путь остаются, всё после `?`/`&` — нет). Текст ошибки нижележащего API
+ * иногда содержит presigned-ссылку с токеном в query — по
+ * `mcp-development-standard/references/security-checklist.md` §6 ответ
+ * инструмента НИКОГДА не должен пересказывать `str(e)` дословно: ссылка с
+ * секретом в query, попавшая в отчёт модели, уезжает в транскрипт чата.
+ * Обязательно применяется перед любой вставкой чужого текста ошибки в ответ
+ * (и, для обороны в глубину, перед записью в аудит). */
+export function stripUrlQuery(s: string): string {
+  return s.replace(/(https?:\/\/[^\s?&#]+)[?&][^\s]*/g, "$1");
+}
+
+/** Бюджет добора пруфа post-verify для `already_executed` (ниже). Аудит-
+ * строку `tryAutoExecute` пишет СИНХРОННО с `consumeManifest` (манифест уже
+ * DONE), а пруф/ошибку дописывает `updateConsentAuditOutcome` ПОЗЖЕ — когда
+ * реально завершится `executor.execute` (сетевой вызов, секунды). Без добора
+ * sync-wait, увидевший свежий DONE, читает аудит-строку РАНЬШЕ, чем в неё
+ * попал пруф, и честно (но бесполезно) пишет «пруф не найден» на каждом
+ * втором запросе. 6×500мс = максимум 2.5с сверху — в бюджете (см. задачу). */
+const EXECUTION_AUDIT_POLL_ATTEMPTS = 6;
+const EXECUTION_AUDIT_POLL_MS = 500;
+
+/** true, если строка аудита УЖЕ содержит финальный исход мутации (провал
+ * ЛИБО пруф post-verify) — добор можно останавливать раньше лимита попыток. */
+function hasExecutionOutcome(audit: ConsentExecutionAudit | null): boolean {
+  if (!audit) return false;
+  if (audit.outcome === "failed" || (audit.error != null && audit.error !== "")) return true;
+  return audit.postVerifyResult != null && audit.postVerifyResult !== "";
+}
+
 /**
  * Собирает ОТЧЁТ ОБ ИСПОЛНЕНИИ для исхода `already_executed`: мутацию уже
  * сделал другой канал (веб-хаб `POST /pending-consents/decide` или поллер
@@ -496,23 +526,37 @@ async function buildAlreadyExecutedReport(args: {
   bindingOk: boolean;
   store: ConsentStore;
   server: string;
+  /** Инъекция ожидания для тестов (тот же приём, что `cfg.sleep` в
+   * sync-wait цикле выше) — дефолт настоящий `setTimeout`. */
+  sleep?: (ms: number) => Promise<void>;
 }): Promise<{ report: string; auditId?: string }> {
-  const { manifestId, previewBody, bindingOk, store, server } = args;
+  const { manifestId, previewBody, bindingOk, store, server, sleep } = args;
+  const sleepFn = sleep ?? defaultSleep;
 
   let audit: ConsentExecutionAudit | null = null;
   if (store.getExecutionAudit) {
-    try {
-      audit = await store.getExecutionAudit(manifestId, server);
-    } catch (err) {
-      // Fail-soft ТОЛЬКО для обогащения текста: сам факт исполнения уже
-      // установлен статусом манифеста (DONE), и подавление ошибки чтения
-      // аудита не может привести к повторной мутации — payload наружу не
-      // отдаётся ни в одной ветке этой функции.
-      console.error(
-        `consent: не смог прочитать аудит исполнения манифеста ${manifestId}: ` +
-          (err instanceof Error ? err.message : String(err)),
-      );
-      audit = null;
+    for (let attempt = 0; attempt < EXECUTION_AUDIT_POLL_ATTEMPTS; attempt++) {
+      try {
+        audit = await store.getExecutionAudit(manifestId, server);
+      } catch (err) {
+        // Fail-soft ТОЛЬКО для обогащения текста: сам факт исполнения уже
+        // установлен статусом манифеста (DONE), и подавление ошибки чтения
+        // аудита не может привести к повторной мутации — payload наружу не
+        // отдаётся ни в одной ветке этой функции. Ошибка чтения — не гонка,
+        // повторный опрос той же операции не поможет, поэтому не ретраим.
+        console.error(
+          `consent: не смог прочитать аудит исполнения манифеста ${manifestId}: ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+        audit = null;
+        break;
+      }
+      if (hasExecutionOutcome(audit)) break;
+      // Строки ещё нет ИЛИ она есть, но `outcome:"confirmed"` без пруфа —
+      // `executor.execute` мог не успеть дописать `updateConsentAuditOutcome`
+      // между `consumeManifest` (DONE уже виден) и этим чтением. Ждём и
+      // пробуем снова, кроме последней попытки.
+      if (attempt < EXECUTION_AUDIT_POLL_ATTEMPTS - 1) await sleepFn(EXECUTION_AUDIT_POLL_MS);
     }
   }
 
@@ -526,7 +570,7 @@ async function buildAlreadyExecutedReport(args: {
 
   let outcomeBlock: string;
   if (failed) {
-    const errText = audit?.error ? inlineReply(audit.error, 300) : "текст ошибки не записан";
+    const errText = audit?.error ? inlineReply(stripUrlQuery(audit.error), 300) : "текст ошибки не записан";
     outcomeBlock =
       `**Фактический результат:** мутация была запущена другим каналом и ЗАВЕРШИЛАСЬ ОШИБКОЙ — ${errText}. ` +
       "Часть изменений могла всё же примениться — проверь состояние объектов, прежде чем повторять." +
@@ -945,6 +989,7 @@ export async function requireConsent<T = unknown>(
           bindingOk,
           store,
           server: cfg.server,
+          sleep: cfg.sleep,
         });
         return {
           kind: "already_executed",

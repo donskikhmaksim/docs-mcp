@@ -224,6 +224,99 @@ console.log("\n[2b] чужой канал исполнил с ОШИБКОЙ —
   check("текст ошибки донесён до модели", dec.report.includes("403"), dec.report.slice(-300));
 }
 
+// ── [2c] добор пруфа: аудит уже есть (confirmed), но пруф допишется ПОЗЖЕ ───
+console.log("\n[2c] добор пруфа: строка аудита появляется сразу, но post_verify_result дописывается позже (execute ещё выполняется) — buildAlreadyExecutedReport дожидается, не сдаётся на первой попытке");
+{
+  const { clock, sleep } = makeClock();
+  const store = makeStore();
+  let getExecAuditCalls = 0;
+  store.getExecutionAudit = async () => {
+    getExecAuditCalls++;
+    if (getExecAuditCalls < 3) {
+      // Строка УЖЕ есть (тот, кто исполнил, успел appendConsentAudit), но
+      // пруф ещё не дописан — ровно та гонка, которую добор должен закрыть:
+      // updateConsentAuditOutcome с постVerify придёт чуть позже execute.
+      return { id: "audit-late", outcome: "confirmed", postVerifyResult: null, error: null, actor: "web" };
+    }
+    return {
+      id: "audit-late",
+      outcome: "confirmed",
+      postVerifyResult: "### 🧾 Независимая проверка\n\n- ✅ «DOC1»: готово",
+      error: null,
+      actor: "web",
+    };
+  };
+  let ticks = 0;
+  const cfg = baseCfg(clock, { syncWaitMs: 25_000, syncPollMs: 1_000 });
+  cfg.sleep = async (ms) => {
+    ticks++;
+    await sleep(ms);
+    if (ticks === 2) {
+      const id = [...store.manifests.keys()][0];
+      await store.consumeManifest(id, "docs", "[веб-хаб: подтверждено]");
+    }
+  };
+  const dec = await requireConsent({ tool: "docs_replace_text", accountLabel: "work", plan, rehash: rehashOk, store, cfg });
+  check("kind=already_executed", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+  check("добор реально попытался БОЛЬШЕ одного раза (getExecutionAudit)", getExecAuditCalls >= 3, `calls=${getExecAuditCalls}`);
+  check("итоговый отчёт содержит дождавшийся пруф, а не «не удалось перепроверить»", dec.report.includes("Независимая проверка") && dec.report.includes("готово"), dec.report.slice(-300));
+  check("заголовок ✅ (пруф найден, binding в порядке)", dec.report.includes("✅"));
+}
+
+// ── [2d] добор пруфа: пруф так и не появился — бюджет попыток конечен ───────
+console.log("\n[2d] добор пруфа: пруф НИКОГДА не появляется — попыток не больше бюджета (6), отчёт честно говорит «не удалось перепроверить»");
+{
+  const { clock, sleep } = makeClock();
+  const store = makeStore();
+  let getExecAuditCalls = 0;
+  store.getExecutionAudit = async () => {
+    getExecAuditCalls++;
+    return { id: "audit-stuck", outcome: "confirmed", postVerifyResult: null, error: null, actor: "web" };
+  };
+  let ticks = 0;
+  const cfg = baseCfg(clock, { syncWaitMs: 25_000, syncPollMs: 1_000 });
+  cfg.sleep = async (ms) => {
+    ticks++;
+    await sleep(ms);
+    if (ticks === 2) {
+      const id = [...store.manifests.keys()][0];
+      await store.consumeManifest(id, "docs", "[веб-хаб: подтверждено]");
+    }
+  };
+  const dec = await requireConsent({ tool: "docs_replace_text", accountLabel: "work", plan, rehash: rehashOk, store, cfg });
+  check("kind=already_executed", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+  check("добор остановился в пределах бюджета (≤6 попыток), а не завис", getExecAuditCalls <= 6, `calls=${getExecAuditCalls}`);
+  check("добор реально пытался больше одного раза", getExecAuditCalls > 1, `calls=${getExecAuditCalls}`);
+  check("честно сказано, что не удалось перепроверить (аудит есть, пруфа нет)", dec.report.includes("отсутствует") || dec.report.includes("не может"), dec.report.slice(-300));
+}
+
+// ── [2e] текст ошибки чужого исполнения содержит URL с query — вырезается ───
+console.log("\n[2e] чужое исполнение упало с ошибкой, содержащей URL с query (presigned-ссылка/токен) — в отчёте query вырезан, host+path остались");
+{
+  const { clock, sleep } = makeClock();
+  const store = makeStore();
+  const cfg = baseCfg(clock, { syncWaitMs: 25_000, syncPollMs: 1_000 });
+  let ticks = 0;
+  cfg.sleep = async (ms) => {
+    ticks++;
+    await sleep(ms);
+    if (ticks === 2) {
+      await simulateWebHubExecute(store, [...store.manifests.keys()][0], {
+        error:
+          "Google API 403 at https://storage.googleapis.com/bucket/file?X-Goog-Signature=SECRETTOKEN123&X-Goog-Expires=900",
+      });
+    }
+  };
+  const dec = await requireConsent({ tool: "docs_replace_text", accountLabel: "work", plan, rehash: rehashOk, store, cfg });
+  check("kind=already_executed", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+  check(
+    "query-параметры (включая секретный токен) вырезаны из ответа модели",
+    !dec.report.includes("SECRETTOKEN123") && !dec.report.includes("X-Goog-Signature"),
+    dec.report.slice(-400),
+  );
+  check("host+path остались (диагностика не потеряна полностью)", dec.report.includes("storage.googleapis.com/bucket/file"), dec.report.slice(-400));
+}
+
 // ── [3] отклонено в окне — refused, мутации нет ──────────────────────────────
 console.log("\n[3] отклонено «человеком» в окне (веб-хаб reject) — refused, манифест INVALIDATED, мутации нет");
 {
